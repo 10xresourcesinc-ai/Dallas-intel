@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+lxml
+urllib3
+pdfplumber
+playwright
