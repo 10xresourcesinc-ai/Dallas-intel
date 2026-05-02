@@ -140,10 +140,10 @@ class DallasCodeScraper:
         while True:
             try:
                 params = {
-                    "$where":  f"date_of_service_refused >= '{cutoff_str}'",
+                    "$where":  f"created >= '{cutoff_str}'",
                     "$limit":  limit,
                     "$offset": offset,
-                    "$order":  "date_of_service_refused DESC",
+                    "$order":  "created DESC",
                 }
                 r = session.get(DALLAS_CODE_URL, params=params, timeout=30)
                 if r.status_code != 200:
@@ -169,17 +169,30 @@ class DallasCodeScraper:
         return records
 
     def _to_record(self, row: dict) -> Optional[dict]:
-        address = (row.get("violation_address") or row.get("address") or "").strip().title()
+        # Build address from split columns: str_num + str_prefix + str_nam + str_suffix
+        str_num    = str(row.get("str_num") or "").strip()
+        str_prefix = (row.get("str_prefix") or "").strip()
+        str_nam    = (row.get("str_nam") or "").strip()
+        str_suffix = (row.get("str_suffix") or "").strip()
+        address    = " ".join(filter(None, [str_num, str_prefix, str_nam, str_suffix])).title()
         if not address:
             return None
 
-        vtype   = (row.get("violation_type") or row.get("type") or "Other").strip()
-        sev     = self.SEVERITY.get(vtype, "low")
-        cat     = "CODE_STRUCT" if sev == "high" else "CODE"
+        # Type / severity — dataset uses "nuisance" field + "type" field
+        nuisance = (row.get("nuisance") or "").strip()
+        vtype    = (row.get("type") or nuisance or "Other").strip()
+        # Structural types get high severity
+        structural_kws = ("struct", "foundation", "roof", "wall", "unsafe", "substandard",
+                          "demolish", "board", "vacant")
+        if any(k in vtype.lower() for k in structural_kws):
+            sev = "high"
+        elif any(k in vtype.lower() for k in ("zoning", "permit")):
+            sev = "medium"
+        else:
+            sev = "low"
+        cat = "CODE_STRUCT" if sev == "high" else "CODE"
 
-        filed_raw = (row.get("date_of_service_refused") or
-                     row.get("date_filed") or
-                     row.get("created_date") or "")
+        filed_raw = (row.get("created") or row.get("created_date") or "")
         filed = ""
         if filed_raw:
             try:
@@ -187,15 +200,12 @@ class DallasCodeScraper:
             except Exception:
                 filed = filed_raw[:10]
 
-        city_raw = (row.get("council_district") or "")
-        # Extract city from address if possible (e.g. "1234 Main St, Dallas, TX 75201")
+        # Zone column contains the zip code in this dataset
+        zipcode = str(row.get("zone") or "").strip()
         city = "Dallas"
-        addr_parts = address.rsplit(",", 2)
-        if len(addr_parts) >= 2:
-            city = addr_parts[-2].strip() or "Dallas"
 
         return {
-            "doc_num":      row.get("service_request_num") or row.get("case_number") or "",
+            "doc_num":      str(row.get("service_request_id") or row.get("service_request") or ""),
             "doc_type":     vtype.upper().replace(" ", "_")[:20],
             "cat":          cat,
             "cat_label":    "Substandard Structure" if sev == "high" else "Code Violation",
@@ -208,12 +218,12 @@ class DallasCodeScraper:
             "prop_address": address,
             "prop_city":    city,
             "prop_state":   "TX",
-            "prop_zip":     (row.get("zip_code") or "").strip(),
+            "prop_zip":     zipcode,
             "mail_address": "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
             "source":       "Dallas Code Enforcement",
-            "neighborhood": (row.get("neighborhood") or row.get("council_district") or ""),
+            "neighborhood": (row.get("department") or ""),
             "viol_status":  (row.get("status") or "").strip(),
-            "viol_desc":    vtype,
+            "viol_desc":    nuisance or vtype,
             "viol_severity": sev,
             "delinquent":   False, "delinq_amt": "",
             "homestead":    None,
@@ -544,8 +554,11 @@ class LPScraper:
 # ===========================================================================
 
 class BankruptcyScraper:
-    PAGE_SIZE = 20
-    MAX_PAGES = 100
+    """
+    Pulls Chapter 7 & 13 bankruptcy filings from CourtListener
+    for the Northern District of Texas (txnb).
+    Uses the same proven approach as the Cuyahoga scraper.
+    """
 
     def fetch(self) -> list:
         if not COURTLISTENER_TOKEN:
@@ -553,90 +566,119 @@ class BankruptcyScraper:
             return []
         log.info("Scraping Northern District Texas bankruptcy filings…")
         session = make_session()
-        session.headers.update({"Authorization": f"Token {COURTLISTENER_TOKEN}"})
+        session.headers.update({
+            "Authorization": f"Token {COURTLISTENER_TOKEN}",
+            "Accept": "application/json",
+        })
         records = []
         cutoff  = LOOKBACK_DATE.strftime("%Y-%m-%d")
 
-        for chapter in ["7", "13", "11"]:
-            page = 1
-            while page <= self.MAX_PAGES:
-                try:
-                    params = {
-                        "court":            CL_BK_COURT,
-                        "chapter":          chapter,
-                        "date_filed__gte":  cutoff,
-                        "page_size":        self.PAGE_SIZE,
-                        "page":             page,
-                    }
-                    r = session.get(CL_BK_URL, params=params, timeout=30)
-                    if r.status_code == 429:
-                        log.warning("BK rate limited — sleeping 60s")
-                        time.sleep(60)
-                        continue
-                    if r.status_code != 200:
-                        log.warning("BK Ch.%s HTTP %d", chapter, r.status_code)
-                        break
-                    data = r.json()
-                    results = data.get("results", [])
-                    if not results:
-                        break
-                    log.info("BK chapter %s page %d: %d results", chapter, page, len(results))
-                    for item in results:
-                        rec = self._to_record(item, chapter)
-                        if rec:
-                            records.append(rec)
-                    if not data.get("next"):
-                        break
-                    page += 1
-                    time.sleep(1)
-                except Exception as e:
-                    log.warning("BK Ch.%s page %d error: %s", chapter, page, e)
-                    break
+        for chapter in ["7", "13"]:
+            fetched = self._fetch_chapter(session, chapter, cutoff, records)
+            log.info("BK chapter %s: %d records", chapter, fetched)
 
-        log.info("BK: %d records", len(records))
+        log.info("BK: %d total records", len(records))
         return records
 
-    def _to_record(self, item: dict, chapter: str) -> Optional[dict]:
-        name = (item.get("debtor_name") or item.get("name") or "").strip()
-        if not name:
+    def _fetch_chapter(self, session, chapter: str, cutoff: str, records: list) -> int:
+        params = {
+            "docket__court":           CL_BK_COURT,
+            "chapter":                 chapter,
+            "docket__date_filed__gte": cutoff,
+            "order_by":                "-docket__date_filed",
+            "page_size":               100,
+            "format":                  "json",
+            "fields":                  "docket,chapter,date_filed",
+        }
+        next_url = CL_BK_URL
+        page = 1
+        fetched = 0
+        while next_url:
+            try:
+                r = session.get(next_url,
+                                params=params if page == 1 else None,
+                                timeout=30)
+                if r.status_code == 429:
+                    log.warning("CourtListener rate limited — stopping BK")
+                    break
+                if r.status_code != 200:
+                    log.warning("BK Ch.%s HTTP %d: %s", chapter, r.status_code, r.text[:200])
+                    break
+                data    = r.json()
+                results = data.get("results", [])
+                if not results:
+                    break
+                log.info("BK chapter %s page %d: %d results", chapter, page, len(results))
+                for item in results:
+                    rec = self._to_record(session, item, chapter)
+                    if rec:
+                        records.append(rec)
+                        fetched += 1
+                next_url = data.get("next")
+                page += 1
+                time.sleep(1)
+            except Exception as e:
+                log.warning("BK Ch.%s page %d error: %s", chapter, page, e)
+                break
+        return fetched
+
+    def _to_record(self, session, item: dict, chapter: str) -> Optional[dict]:
+        docket_data = item.get("docket") or {}
+
+        # docket may be a URL string — fetch it for case name and docket number
+        if isinstance(docket_data, str):
+            try:
+                r = session.get(docket_data,
+                                params={"format": "json",
+                                        "fields": "case_name,docket_number,date_filed,absolute_url"},
+                                timeout=15)
+                docket_data = r.json() if r.status_code == 200 else {}
+            except Exception:
+                docket_data = {}
+
+        case_name = (docket_data.get("case_name") or "").strip()
+        case_num  = (docket_data.get("docket_number") or "").strip()
+        filed_raw = docket_data.get("date_filed") or item.get("date_filed") or ""
+        abs_url   = docket_data.get("absolute_url", "")
+        clerk_url = f"https://www.courtlistener.com{abs_url}" if abs_url else                     "https://www.courtlistener.com/recap/"
+
+        if not case_name:
             return None
 
-        filed_raw = item.get("date_filed") or item.get("date_created") or ""
-        filed = ""
+        # Strip "In re:" prefix common in bankruptcy case names
+        name = re.sub(r"(?i)^in\s+re:?\s*", "", case_name).strip()
+        name = re.sub(r"\s*\(.*?\)", "", name).strip()
+
+        filed_fmt = ""
         if filed_raw:
             try:
-                filed = datetime.fromisoformat(filed_raw[:10]).strftime("%m/%d/%Y")
+                filed_fmt = datetime.strptime(filed_raw[:10], "%Y-%m-%d").strftime("%m/%d/%Y")
             except Exception:
-                filed = filed_raw[:10]
-
-        address = (item.get("street") or "").strip().title()
-        city    = (item.get("city") or "").strip().title()
-        state   = (item.get("state") or "TX").strip().upper()
-        zipcode = (item.get("zip_code") or "").strip()
+                filed_fmt = filed_raw[:10]
 
         return {
-            "doc_num":      item.get("docket_number") or item.get("id") or "",
+            "doc_num":      case_num or f"BK-{name[:20]}",
             "doc_type":     f"BK{chapter}",
             "cat":          "BK",
             "cat_label":    f"Bankruptcy Ch.{chapter}",
-            "filed":        filed,
-            "owner":        name.title(),
+            "filed":        filed_fmt,
+            "owner":        name,
             "grantee":      "",
             "amount":       None,
             "legal":        "",
-            "clerk_url":    item.get("absolute_url") or "",
-            "prop_address": address,
-            "prop_city":    city,
-            "prop_state":   state,
-            "prop_zip":     zipcode,
-            "mail_address": "", "mail_city": "", "mail_state": state, "mail_zip": "",
+            "clerk_url":    clerk_url,
+            "prop_address": "",
+            "prop_city":    "Dallas",
+            "prop_state":   "TX",
+            "prop_zip":     "",
+            "mail_address": "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
             "source":       "Court Docket",
             "neighborhood": "", "viol_status": "", "viol_desc": "", "viol_severity": "",
             "delinquent":   False, "delinq_amt": "",
             "homestead":    None,
             "appraised":    "",
-            "out_of_state": state not in ("", "TX"),
-            "luc":          "", "luc_desc":   "",
+            "out_of_state": False,
+            "luc":          "", "luc_desc": "",
             "bk_chapter":   chapter,
             "score":        0,
             "flags":        [],
