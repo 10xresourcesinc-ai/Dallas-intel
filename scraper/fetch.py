@@ -51,7 +51,10 @@ COURTLISTENER_TOKEN = os.getenv("COURTLISTENER_TOKEN", "")
 # ---------------------------------------------------------------------------
 
 # Dallas OpenData Socrata — Code Violations (dataset x9pz-kdq9)
-DALLAS_CODE_URL = "https://www.dallasopendata.com/resource/x9pz-kdq9.json"
+# Dallas code violations — archived dataset (all records, filter in Python)
+DALLAS_CODE_URL     = "https://www.dallasopendata.com/resource/x9pz-kdq9.json"
+# Dallas 311 active service requests — code compliance category
+DALLAS_311_URL      = "https://www.dallasopendata.com/resource/dkp4-ix7s.json"
 
 # Dallas County Clerk PublicSearch (same Neumo platform as Cuyahoga)
 DALLAS_PUBLICSEARCH = "https://dallas.tx.publicsearch.us"
@@ -132,54 +135,75 @@ class DallasCodeScraper:
     def fetch(self) -> list:
         log.info("Scraping Dallas code violations (Socrata)…")
         session = make_session()
-        cutoff_str = LOOKBACK_DATE.strftime("%Y-%m-%dT%H:%M:%S")
         records = []
-        offset = 0
-        limit  = 1000
 
-        while True:
-            try:
-                params = {
-                    "$where":  f"created >= '{cutoff_str}'",
-                    "$limit":  limit,
-                    "$offset": offset,
-                    "$order":  "created DESC",
-                }
-                r = session.get(DALLAS_CODE_URL, params=params, timeout=30)
-                if r.status_code != 200:
-                    log.warning("Socrata HTTP %d — %s", r.status_code, r.text[:200])
-                    break
-                batch = r.json()
-                if not batch:
-                    break
-                log.info("Code violations page offset=%d → %d rows", offset, len(batch))
-                for row in batch:
-                    rec = self._to_record(row)
-                    if rec:
-                        records.append(rec)
-                if len(batch) < limit:
-                    break
-                offset += limit
-                time.sleep(0.3)
-            except Exception as e:
-                log.warning("Socrata error: %s", e)
-                break
+        # Try the active 311 dataset first, fall back to archived violations dataset
+        sources = [
+            (DALLAS_311_URL,  "311 active",  "$where",
+             "service_type_description like '%CODE%' OR service_type_description like '%STRUCT%'"),
+            (DALLAS_CODE_URL, "violations",  None, None),
+        ]
 
-        log.info("Code violations: %d records", len(records))
+        for url, label, where_key, where_val in sources:
+            offset = 0
+            limit  = 1000
+            batch_total = 0
+            while True:
+                try:
+                    params = {
+                        "$limit":  limit,
+                        "$offset": offset,
+                        "$order":  "created_date DESC" if "311" in label else "updated DESC",
+                    }
+                    if where_key and where_val:
+                        params[where_key] = where_val
+                    r = session.get(url, params=params, timeout=30)
+                    if r.status_code != 200:
+                        log.warning("Socrata %s HTTP %d — %s",
+                                    label, r.status_code, r.text[:200])
+                        break
+                    batch = r.json()
+                    if not batch:
+                        break
+                    batch_total += len(batch)
+                    for row in batch:
+                        rec = self._to_record(row)
+                        if rec:
+                            records.append(rec)
+                    if len(batch) < limit:
+                        break
+                    offset += limit
+                    # Stop after 10k rows from archived dataset
+                    if "violations" in label and offset >= 10000:
+                        break
+                    time.sleep(0.3)
+                except Exception as e:
+                    log.warning("Socrata %s error: %s", label, e)
+                    break
+            log.info("Code violations %s: %d rows fetched", label, batch_total)
+            if records:
+                break  # Got results from first source, skip fallback
+
+        log.info("Code violations total: %d records", len(records))
         return records
 
     def _to_record(self, row: dict) -> Optional[dict]:
-        # Build address from split columns: str_num + str_prefix + str_nam + str_suffix
-        str_num    = str(row.get("str_num") or "").strip()
-        str_prefix = (row.get("str_prefix") or "").strip()
-        str_nam    = (row.get("str_nam") or "").strip()
-        str_suffix = (row.get("str_suffix") or "").strip()
-        address    = " ".join(filter(None, [str_num, str_prefix, str_nam, str_suffix])).title()
+        # Handle both 311 dataset and archived violations dataset field names
+        # 311 dataset: address, service_type_description, created_date, zip_code
+        # Violations dataset: str_num, str_prefix, str_nam, str_suffix, zone(zip), nuisance, created
+        address = (row.get("address") or "").strip().title()
+        if not address:
+            str_num    = str(row.get("str_num") or "").strip()
+            str_prefix = (row.get("str_prefix") or "").strip()
+            str_nam    = (row.get("str_nam") or "").strip()
+            str_suffix = (row.get("str_suffix") or "").strip()
+            address    = " ".join(filter(None, [str_num, str_prefix, str_nam, str_suffix])).title()
         if not address:
             return None
 
-        # Type / severity — dataset uses "nuisance" field + "type" field
-        nuisance = (row.get("nuisance") or "").strip()
+        # Type / severity — violations dataset: nuisance+type; 311: service_type_description
+        nuisance = (row.get("nuisance") or
+                    row.get("service_type_description") or "").strip()
         vtype    = (row.get("type") or nuisance or "Other").strip()
         # Structural types get high severity
         structural_kws = ("struct", "foundation", "roof", "wall", "unsafe", "substandard",
@@ -192,7 +216,8 @@ class DallasCodeScraper:
             sev = "low"
         cat = "CODE_STRUCT" if sev == "high" else "CODE"
 
-        filed_raw = (row.get("created") or row.get("created_date") or "")
+        filed_raw = (row.get("created_date") or row.get("created") or
+                     row.get("date_filed") or "")
         filed = ""
         if filed_raw:
             try:
@@ -200,12 +225,14 @@ class DallasCodeScraper:
             except Exception:
                 filed = filed_raw[:10]
 
-        # Zone column contains the zip code in this dataset
-        zipcode = str(row.get("zone") or "").strip()
+        # Zone = zip in violations dataset; zip_code in 311 dataset
+        zipcode = str(row.get("zip_code") or row.get("zone") or "").strip()
         city = "Dallas"
 
         return {
-            "doc_num":      str(row.get("service_request_id") or row.get("service_request") or ""),
+            "doc_num":      str(row.get("service_request_num") or
+                             row.get("service_request_id") or
+                             row.get("service_request") or ""),
             "doc_type":     vtype.upper().replace(" ", "_")[:20],
             "cat":          cat,
             "cat_label":    "Substandard Structure" if sev == "high" else "Code Violation",
