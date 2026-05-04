@@ -648,6 +648,8 @@ class BankruptcyScraper:
                 if not results:
                     break
                 log.info("BK chapter %s page %d: %d results", chapter, page, len(results))
+                if page == 1 and results:
+                    log.info("BK fields sample: %s", list(results[0].keys()))
                 for item in results:
                     rec = self._to_record(session, item, chapter)
                     if rec:
@@ -656,16 +658,24 @@ class BankruptcyScraper:
                 next_link = data.get("next")
                 if not next_link:
                     break
-                # Use cursor pagination to avoid "deep pagination not allowed" at page 100
-                import urllib.parse as _up
-                qs = _up.parse_qs(_up.urlparse(next_link).query)
-                cursor_val = qs.get("cursor", [None])[0]
-                if cursor_val:
-                    next_url = CL_BK_URL
-                    params = {"cursor": cursor_val, "format": "json"}
+                # CourtListener blocks requests past page 100.
+                # Stop at 99 and use the earliest date from this batch to
+                # start a new window, capturing all records without deep pagination.
+                if page >= 99:
+                    # Get oldest date in this batch and restart from there
+                    dates = [r.get("date_filed","") for r in results if r.get("date_filed")]
+                    if dates:
+                        oldest = min(dates)
+                        log.info("BK Ch.%s hit page 99 — restarting from %s", chapter, oldest)
+                        params["docket__date_filed__lte"] = oldest
+                        params["page"] = 1
+                        next_url = CL_BK_URL
+                        page = 1
+                    else:
+                        break
                 else:
                     next_url = next_link
-                page += 1
+                    page += 1
                 time.sleep(1)
             except Exception as e:
                 log.warning("BK Ch.%s page %d error: %s", chapter, page, e)
