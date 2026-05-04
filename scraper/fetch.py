@@ -613,7 +613,7 @@ class BankruptcyScraper:
             "chapter":                 chapter,
             "docket__date_filed__gte": cutoff,
             "order_by":                "-docket__date_filed",
-            "page_size":               20,   # smaller = faster, avoids deep pagination
+            "page_size":               10,   # small pages — each record needs a docket sub-fetch
             "format":                  "json",
             "fields":                  "docket,chapter,date_filed,debtor_name,docket_number",
         }
@@ -683,23 +683,32 @@ class BankruptcyScraper:
         return fetched
 
     def _to_record(self, session, item: dict, chapter: str) -> Optional[dict]:
-        docket_data = item.get("docket") or {}
-        docket_url  = ""
+        docket_ref = item.get("docket") or ""
 
-        # docket is a URL string in bankruptcy-information endpoint — don't sub-fetch
-        # (each sub-fetch adds 15s timeout risk). Use fields returned directly instead.
-        if isinstance(docket_data, str):
-            docket_url  = docket_data
-            docket_data = {}
+        # CourtListener ignores the fields= param on bankruptcy-information —
+        # only returns chapter + docket URL. Must fetch the docket to get case_name.
+        docket_data = {}
+        if isinstance(docket_ref, str) and docket_ref:
+            docket_url = (docket_ref if docket_ref.startswith("http")
+                          else "https://www.courtlistener.com" + docket_ref)
+            try:
+                r = session.get(docket_url,
+                                params={"format": "json",
+                                        "fields": "case_name,docket_number,date_filed,absolute_url"},
+                                timeout=20)
+                if r.status_code == 200:
+                    docket_data = r.json()
+            except Exception:
+                pass
+        elif isinstance(docket_ref, dict):
+            docket_data = docket_ref
+            docket_url  = docket_data.get("absolute_url", "")
 
-        # bankruptcy-information returns debtor_name and date_filed directly
-        case_name = (item.get("debtor_name") or
-                     docket_data.get("case_name") or "").strip()
-        case_num  = (item.get("docket_number") or
-                     docket_data.get("docket_number") or "").strip()
-        filed_raw = item.get("date_filed") or docket_data.get("date_filed") or ""
-        clerk_url = ("https://www.courtlistener.com" + docket_url
-                     if docket_url and docket_url.startswith("/")
+        case_name = (docket_data.get("case_name") or "").strip()
+        case_num  = (docket_data.get("docket_number") or "").strip()
+        filed_raw = docket_data.get("date_filed") or item.get("date_filed") or ""
+        abs_url   = docket_data.get("absolute_url", "")
+        clerk_url = ("https://www.courtlistener.com" + abs_url if abs_url
                      else "https://www.courtlistener.com/recap/")
 
         if not case_name:
