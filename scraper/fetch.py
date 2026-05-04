@@ -613,9 +613,9 @@ class BankruptcyScraper:
             "chapter":                 chapter,
             "docket__date_filed__gte": cutoff,
             "order_by":                "-docket__date_filed",
-            "page_size":               100,
+            "page_size":               20,   # smaller = faster, avoids deep pagination
             "format":                  "json",
-            "fields":                  "docket,chapter,date_filed",
+            "fields":                  "docket,chapter,date_filed,debtor_name,docket_number",
         }
         next_url = CL_BK_URL
         page = 1
@@ -653,7 +653,18 @@ class BankruptcyScraper:
                     if rec:
                         records.append(rec)
                         fetched += 1
-                next_url = data.get("next")
+                next_link = data.get("next")
+                if not next_link:
+                    break
+                # Use cursor pagination to avoid "deep pagination not allowed" at page 100
+                import urllib.parse as _up
+                qs = _up.parse_qs(_up.urlparse(next_link).query)
+                cursor_val = qs.get("cursor", [None])[0]
+                if cursor_val:
+                    next_url = CL_BK_URL
+                    params = {"cursor": cursor_val, "format": "json"}
+                else:
+                    next_url = next_link
                 page += 1
                 time.sleep(1)
             except Exception as e:
