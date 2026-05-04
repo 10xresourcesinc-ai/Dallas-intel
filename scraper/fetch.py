@@ -622,9 +622,21 @@ class BankruptcyScraper:
         fetched = 0
         while next_url:
             try:
-                r = session.get(next_url,
-                                params=params if page == 1 else None,
-                                timeout=30)
+                resp = None
+                for attempt in range(3):
+                    try:
+                        resp = session.get(next_url,
+                                           params=params if page == 1 else None,
+                                           timeout=60)
+                        break
+                    except Exception as te:
+                        log.warning("BK Ch.%s page %d attempt %d timeout: %s",
+                                    chapter, page, attempt+1, te)
+                        time.sleep(10)
+                if resp is None:
+                    log.warning("BK Ch.%s page %d — all retries failed, stopping", chapter, page)
+                    break
+                r = resp
                 if r.status_code == 429:
                     log.warning("CourtListener rate limited — stopping BK")
                     break
@@ -651,23 +663,23 @@ class BankruptcyScraper:
 
     def _to_record(self, session, item: dict, chapter: str) -> Optional[dict]:
         docket_data = item.get("docket") or {}
+        docket_url  = ""
 
-        # docket may be a URL string — fetch it for case name and docket number
+        # docket is a URL string in bankruptcy-information endpoint — don't sub-fetch
+        # (each sub-fetch adds 15s timeout risk). Use fields returned directly instead.
         if isinstance(docket_data, str):
-            try:
-                r = session.get(docket_data,
-                                params={"format": "json",
-                                        "fields": "case_name,docket_number,date_filed,absolute_url"},
-                                timeout=15)
-                docket_data = r.json() if r.status_code == 200 else {}
-            except Exception:
-                docket_data = {}
+            docket_url  = docket_data
+            docket_data = {}
 
-        case_name = (docket_data.get("case_name") or "").strip()
-        case_num  = (docket_data.get("docket_number") or "").strip()
-        filed_raw = docket_data.get("date_filed") or item.get("date_filed") or ""
-        abs_url   = docket_data.get("absolute_url", "")
-        clerk_url = f"https://www.courtlistener.com{abs_url}" if abs_url else                     "https://www.courtlistener.com/recap/"
+        # bankruptcy-information returns debtor_name and date_filed directly
+        case_name = (item.get("debtor_name") or
+                     docket_data.get("case_name") or "").strip()
+        case_num  = (item.get("docket_number") or
+                     docket_data.get("docket_number") or "").strip()
+        filed_raw = item.get("date_filed") or docket_data.get("date_filed") or ""
+        clerk_url = ("https://www.courtlistener.com" + docket_url
+                     if docket_url and docket_url.startswith("/")
+                     else "https://www.courtlistener.com/recap/")
 
         if not case_name:
             return None
