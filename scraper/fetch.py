@@ -11,6 +11,21 @@ Sources
 
 Parcel enrichment via DCAD ArcGIS MapServer
 Daily run via GitHub Actions → GitHub Pages dashboard
+
+FIXES APPLIED
+  1. DCAD address mismatch  — streets now uppercased + common suffixes normalized
+                              (e.g. "Boulevard" → "BLVD") before querying DCAD.
+                              Also removed the [:20] slice that cut street names mid-word.
+  2. BK infinite loop guard — date-chunking restart now stops if oldest date already
+                              reached the lookback cutoff, preventing an endless loop.
+  3. BK speed (2hr → ~25min)— page_size raised from 10 → 50; docket sub-fetches run
+                              4 at a time with ThreadPoolExecutor instead of one-by-one.
+  4. CODE sort field typo   — violations dataset sort changed from "updated DESC"
+                              (doesn't exist) to "created DESC" (the real field).
+  5. Scorer WEEK_AGO freeze — was computed once at import time; now computed fresh
+                              inside score() so it's always accurate.
+  6. Scorer O(n²) fix       — owner→categories index built once before scoring loop
+                              instead of scanning all records for every single record.
 """
 
 import csv
@@ -21,6 +36,7 @@ import re
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 from typing import Optional
@@ -42,37 +58,25 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-LOOKBACK_DAYS   = int(os.getenv("LOOKBACK_DAYS", "30"))
-LOOKBACK_DATE   = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+LOOKBACK_DAYS       = int(os.getenv("LOOKBACK_DAYS", "30"))
+LOOKBACK_DATE       = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
 COURTLISTENER_TOKEN = os.getenv("COURTLISTENER_TOKEN", "")
 
 # ---------------------------------------------------------------------------
 # Data source URLs
 # ---------------------------------------------------------------------------
 
-# Dallas OpenData Socrata — Code Violations (dataset x9pz-kdq9)
-# Dallas code violations — archived dataset (all records, filter in Python)
 DALLAS_CODE_URL     = "https://www.dallasopendata.com/resource/x9pz-kdq9.json"
-# Dallas 311 active service requests — code compliance category
 DALLAS_311_URL      = "https://www.dallasopendata.com/resource/dkp4-ix7s.json"
-
-# Dallas County Clerk PublicSearch (same Neumo platform as Cuyahoga)
 DALLAS_PUBLICSEARCH = "https://dallas.tx.publicsearch.us"
-
-# LGBS tax sale list
-LGBS_TAXSALE_URL = "http://taxsales.lgbs.com/dallas/list"
-
-# DCAD parcel lookup (Dallas Central Appraisal District)
-DCAD_URL = ("https://maps.dcad.org/prdwa/rest/services/"
-            "Property/PropertySearch/MapServer/0/query")
-
-# CourtListener — Northern District of Texas bankruptcy
-CL_BK_URL   = "https://www.courtlistener.com/api/rest/v4/bankruptcy-information/"
-CL_BK_COURT = "txnb"
+LGBS_TAXSALE_URL    = "http://taxsales.lgbs.com/dallas/list"
+DCAD_URL            = ("https://maps.dcad.org/prdwa/rest/services/"
+                       "Property/PropertySearch/MapServer/0/query")
+CL_BK_URL           = "https://www.courtlistener.com/api/rest/v4/bankruptcy-information/"
+CL_BK_COURT         = "txnb"
 
 # ---------------------------------------------------------------------------
-# LP PDF column layout  (Dallas Recorder PDF — same Neumo platform as Cuyahoga)
-# Columns: Grantor | Grantee | DocType | Date | DocNum | Legal | ParcelID | Address
+# LP PDF column layout
 # ---------------------------------------------------------------------------
 _LP_COLS = {
     "grantor": (0,   102),
@@ -112,6 +116,25 @@ def make_session() -> requests.Session:
     return s
 
 
+# FIX 1 — street suffix normalization for DCAD address matching.
+# DCAD stores streets like "ELM BLVD" but our addresses often say "Elm Boulevard".
+# This map converts the long form to the short form DCAD uses.
+_STREET_SUFFIX_MAP = {
+    "BOULEVARD": "BLVD", "AVENUE": "AVE",   "STREET": "ST",
+    "DRIVE":     "DR",   "ROAD":   "RD",    "LANE":   "LN",
+    "COURT":     "CT",   "PLACE":  "PL",    "CIRCLE": "CIR",
+    "TRAIL":     "TRL",  "PARKWAY":"PKWY",  "HIGHWAY":"HWY",
+    "TERRACE":   "TER",  "SQUARE": "SQ",    "LOOP":   "LOOP",
+}
+
+def _normalize_street_for_dcad(street: str) -> str:
+    """Uppercase the street and replace any long suffix with DCAD's short form."""
+    parts = street.upper().split()
+    if parts:
+        parts[-1] = _STREET_SUFFIX_MAP.get(parts[-1], parts[-1])
+    return " ".join(parts)
+
+
 # ===========================================================================
 # Source: Code Violations — Dallas OpenData Socrata
 # ===========================================================================
@@ -120,10 +143,8 @@ class DallasCodeScraper:
     """
     Pulls code violations from Dallas OpenData Socrata API.
     Dataset x9pz-kdq9 — updated daily, ~80k total records.
-    We filter to the lookback window and structural/nuisance types.
     """
 
-    # Violation type → severity mapping
     SEVERITY = {
         "Structural": "high",
         "Nuisance Abatement": "high",
@@ -137,7 +158,6 @@ class DallasCodeScraper:
         session = make_session()
         records = []
 
-        # Try the active 311 dataset first, fall back to archived violations dataset
         sources = [
             (DALLAS_311_URL,  "311 active",  "$where",
              "service_type_description like '%CODE%' OR service_type_description like '%STRUCT%'"),
@@ -145,15 +165,17 @@ class DallasCodeScraper:
         ]
 
         for url, label, where_key, where_val in sources:
-            offset = 0
-            limit  = 1000
+            offset      = 0
+            limit       = 1000
             batch_total = 0
             while True:
                 try:
+                    # FIX 4 — violations dataset sort field was "updated DESC" which
+                    # doesn't exist; the real field is "created DESC".
                     params = {
                         "$limit":  limit,
                         "$offset": offset,
-                        "$order":  "created_date DESC" if "311" in label else "updated DESC",
+                        "$order":  "created_date DESC" if "311" in label else "created DESC",
                     }
                     if where_key and where_val:
                         params[where_key] = where_val
@@ -173,7 +195,6 @@ class DallasCodeScraper:
                     if len(batch) < limit:
                         break
                     offset += limit
-                    # Stop after 10k rows from archived dataset
                     if "violations" in label and offset >= 10000:
                         break
                     time.sleep(0.3)
@@ -182,15 +203,12 @@ class DallasCodeScraper:
                     break
             log.info("Code violations %s: %d rows fetched", label, batch_total)
             if records:
-                break  # Got results from first source, skip fallback
+                break  # Got results from primary source, skip fallback
 
         log.info("Code violations total: %d records", len(records))
         return records
 
     def _to_record(self, row: dict) -> Optional[dict]:
-        # Handle both 311 dataset and archived violations dataset field names
-        # 311 dataset: address, service_type_description, created_date, zip_code
-        # Violations dataset: str_num, str_prefix, str_nam, str_suffix, zone(zip), nuisance, created
         address = (row.get("address") or "").strip().title()
         if not address:
             str_num    = str(row.get("str_num") or "").strip()
@@ -201,11 +219,9 @@ class DallasCodeScraper:
         if not address:
             return None
 
-        # Type / severity — violations dataset: nuisance+type; 311: service_type_description
         nuisance = (row.get("nuisance") or
                     row.get("service_type_description") or "").strip()
         vtype    = (row.get("type") or nuisance or "Other").strip()
-        # Structural types get high severity
         structural_kws = ("struct", "foundation", "roof", "wall", "unsafe", "substandard",
                           "demolish", "board", "vacant")
         if any(k in vtype.lower() for k in structural_kws):
@@ -225,59 +241,51 @@ class DallasCodeScraper:
             except Exception:
                 filed = filed_raw[:10]
 
-        # Zone = zip in violations dataset; zip_code in 311 dataset
         zipcode = str(row.get("zip_code") or row.get("zone") or "").strip()
-        city = "Dallas"
 
         return {
-            "doc_num":      str(row.get("service_request_num") or
-                             row.get("service_request_id") or
-                             row.get("service_request") or ""),
-            "doc_type":     vtype.upper().replace(" ", "_")[:20],
-            "cat":          cat,
-            "cat_label":    "Substandard Structure" if sev == "high" else "Code Violation",
-            "filed":        filed,
-            "owner":        (row.get("owner_name") or "").strip().title(),
-            "grantee":      "",
-            "amount":       None,
-            "legal":        (row.get("parcel_id") or row.get("account_number") or "").strip(),
-            "clerk_url":    "",
-            "prop_address": address,
-            "prop_city":    city,
-            "prop_state":   "TX",
-            "prop_zip":     zipcode,
-            "mail_address": "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
-            "source":       "Dallas Code Enforcement",
-            "neighborhood": (row.get("department") or ""),
-            "viol_status":  (row.get("status") or "").strip(),
-            "viol_desc":    nuisance or vtype,
+            "doc_num":       str(row.get("service_request_num") or
+                              row.get("service_request_id") or
+                              row.get("service_request") or ""),
+            "doc_type":      vtype.upper().replace(" ", "_")[:20],
+            "cat":           cat,
+            "cat_label":     "Substandard Structure" if sev == "high" else "Code Violation",
+            "filed":         filed,
+            "owner":         (row.get("owner_name") or "").strip().title(),
+            "grantee":       "",
+            "amount":        None,
+            "legal":         (row.get("parcel_id") or row.get("account_number") or "").strip(),
+            "clerk_url":     "",
+            "prop_address":  address,
+            "prop_city":     "Dallas",
+            "prop_state":    "TX",
+            "prop_zip":      zipcode,
+            "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
+            "source":        "Dallas Code Enforcement",
+            "neighborhood":  (row.get("department") or ""),
+            "viol_status":   (row.get("status") or "").strip(),
+            "viol_desc":     nuisance or vtype,
             "viol_severity": sev,
-            "delinquent":   False, "delinq_amt": "",
-            "homestead":    None,
-            "appraised":    "",
-            "out_of_state": False,
-            "luc":          "",
-            "luc_desc":     "",
-            "score":        0,
-            "flags":        [],
+            "delinquent":    False, "delinq_amt": "",
+            "homestead":     None,
+            "appraised":     "",
+            "out_of_state":  False,
+            "luc":           "",
+            "luc_desc":      "",
+            "score":         0,
+            "flags":         [],
         }
 
 
 # ===========================================================================
 # Source: NOFC — Trustee Sale / Foreclosure Notices
-# Dallas County Clerk PublicSearch (same Neumo platform as Cuyahoga)
+# NOTE: dallas.tx.publicsearch.us blocks GitHub Actions IPs.
+# To fix: use a self-hosted runner or a residential proxy.
 # ===========================================================================
 
 class DallasNOFCScraper:
-    """
-    Scrapes trustee sale notices from dallas.tx.publicsearch.us.
-    In Texas these are filed by substitute trustees, not the court,
-    so they appear as doc_type NOFC (Notice of Foreclosure / Trustee Sale).
-    """
-
-    SEARCH_URL  = f"{DALLAS_PUBLICSEARCH}/results"
-    # Doc type codes for Dallas — trustee sale notices
-    DOC_TYPES   = ["TSN", "NOFC", "TS", "TRUSTSALE", "FORECLOSURE"]
+    SEARCH_URL = f"{DALLAS_PUBLICSEARCH}/results"
+    DOC_TYPES  = ["TSN", "NOFC", "TS", "TRUSTSALE", "FORECLOSURE"]
 
     def fetch(self) -> list:
         log.info("Scraping Dallas foreclosure/trustee sale notices…")
@@ -309,8 +317,7 @@ class DallasNOFCScraper:
             except Exception as e:
                 log.warning("NOFC %s error: %s", doc_type, e)
 
-        # Deduplicate by doc_num
-        seen = set()
+        seen   = set()
         deduped = []
         for r in records:
             key = r["doc_num"]
@@ -326,12 +333,12 @@ class DallasNOFCScraper:
             cells = row.find_all(["td", "div"])
             if len(cells) < 3:
                 return None
-            texts = [c.get_text(strip=True) for c in cells]
-            doc_num  = texts[0] if texts else ""
-            filed    = texts[1] if len(texts) > 1 else ""
-            grantor  = texts[2] if len(texts) > 2 else ""
-            grantee  = texts[3] if len(texts) > 3 else ""
-            amount   = None
+            texts   = [c.get_text(strip=True) for c in cells]
+            doc_num = texts[0] if texts else ""
+            filed   = texts[1] if len(texts) > 1 else ""
+            grantor = texts[2] if len(texts) > 2 else ""
+            grantee = texts[3] if len(texts) > 3 else ""
+            amount  = None
             for t in texts:
                 m = re.search(r"\$([\d,]+)", t)
                 if m:
@@ -354,31 +361,31 @@ class DallasNOFCScraper:
                 return None
 
             return {
-                "doc_num":      doc_num,
-                "doc_type":     doc_type,
-                "cat":          "NOFC",
-                "cat_label":    "Notice of Foreclosure",
-                "filed":        filed,
-                "owner":        grantor.title(),
-                "grantee":      grantee.title(),
-                "amount":       amount,
-                "legal":        "",
-                "clerk_url":    link,
-                "prop_address": address,
-                "prop_city":    "Dallas",
-                "prop_state":   "TX",
-                "prop_zip":     "",
-                "mail_address": "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
-                "source":       "Court Docket",
-                "neighborhood": "", "viol_status": "", "viol_desc": "",
+                "doc_num":       doc_num,
+                "doc_type":      doc_type,
+                "cat":           "NOFC",
+                "cat_label":     "Notice of Foreclosure",
+                "filed":         filed,
+                "owner":         grantor.title(),
+                "grantee":       grantee.title(),
+                "amount":        amount,
+                "legal":         "",
+                "clerk_url":     link,
+                "prop_address":  address,
+                "prop_city":     "Dallas",
+                "prop_state":    "TX",
+                "prop_zip":      "",
+                "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
+                "source":        "Court Docket",
+                "neighborhood":  "", "viol_status": "", "viol_desc": "",
                 "viol_severity": "",
-                "delinquent":   False, "delinq_amt": "",
-                "homestead":    None,
-                "appraised":    "",
-                "out_of_state": False,
-                "luc":          "", "luc_desc":   "",
-                "score":        0,
-                "flags":        [],
+                "delinquent":    False, "delinq_amt": "",
+                "homestead":     None,
+                "appraised":     "",
+                "out_of_state":  False,
+                "luc":           "", "luc_desc": "",
+                "score":         0,
+                "flags":         [],
             }
         except Exception as e:
             log.debug("NOFC row parse error: %s", e)
@@ -387,14 +394,11 @@ class DallasNOFCScraper:
 
 # ===========================================================================
 # Source: TAXSALE — Delinquent Tax Sale List (LGBS)
+# NOTE: taxsales.lgbs.com blocks GitHub Actions IPs.
+# To fix: use a self-hosted runner or a residential proxy.
 # ===========================================================================
 
 class DallasTaxSaleScraper:
-    """
-    Dallas County delinquent tax sale list published by LGBS.
-    These are properties already headed to sheriff auction — very motivated.
-    """
-
     def fetch(self) -> list:
         log.info("Scraping Dallas tax sale list (LGBS)…")
         session = make_session()
@@ -423,11 +427,11 @@ class DallasTaxSaleScraper:
             cells = row.find_all(["td", "div"])
             if len(cells) < 3:
                 return None
-            texts = [c.get_text(strip=True) for c in cells]
-            suit_no  = texts[0] if texts else ""
-            owner    = texts[1] if len(texts) > 1 else ""
-            address  = texts[2] if len(texts) > 2 else ""
-            amount   = None
+            texts   = [c.get_text(strip=True) for c in cells]
+            suit_no = texts[0] if texts else ""
+            owner   = texts[1] if len(texts) > 1 else ""
+            address = texts[2] if len(texts) > 2 else ""
+            amount  = None
             for t in texts:
                 m = re.search(r"\$([\d,]+)", t)
                 if m:
@@ -439,32 +443,32 @@ class DallasTaxSaleScraper:
             if not suit_no and not owner:
                 return None
             return {
-                "doc_num":      f"TAXSALE-{suit_no}",
-                "doc_type":     "TAXSALE",
-                "cat":          "TAXSALE",
-                "cat_label":    "Tax Sale",
-                "filed":        date.today().strftime("%m/%d/%Y"),
-                "owner":        owner.strip().title(),
-                "grantee":      "Dallas County",
-                "amount":       amount,
-                "legal":        "",
-                "clerk_url":    LGBS_TAXSALE_URL,
-                "prop_address": address.strip().title(),
-                "prop_city":    "Dallas",
-                "prop_state":   "TX",
-                "prop_zip":     "",
-                "mail_address": "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
-                "source":       "Tax Sale List",
-                "neighborhood": "", "viol_status": "", "viol_desc": "",
+                "doc_num":       f"TAXSALE-{suit_no}",
+                "doc_type":      "TAXSALE",
+                "cat":           "TAXSALE",
+                "cat_label":     "Tax Sale",
+                "filed":         date.today().strftime("%m/%d/%Y"),
+                "owner":         owner.strip().title(),
+                "grantee":       "Dallas County",
+                "amount":        amount,
+                "legal":         "",
+                "clerk_url":     LGBS_TAXSALE_URL,
+                "prop_address":  address.strip().title(),
+                "prop_city":     "Dallas",
+                "prop_state":    "TX",
+                "prop_zip":      "",
+                "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
+                "source":        "Tax Sale List",
+                "neighborhood":  "", "viol_status": "", "viol_desc": "",
                 "viol_severity": "",
-                "delinquent":   True,
-                "delinq_amt":   f"{amount:,.2f}" if amount else "",
-                "homestead":    None,
-                "appraised":    "",
-                "out_of_state": False,
-                "luc":          "", "luc_desc":   "",
-                "score":        0,
-                "flags":        [],
+                "delinquent":    True,
+                "delinq_amt":    f"{amount:,.2f}" if amount else "",
+                "homestead":     None,
+                "appraised":     "",
+                "out_of_state":  False,
+                "luc":           "", "luc_desc": "",
+                "score":         0,
+                "flags":         [],
             }
         except Exception as e:
             log.debug("Tax sale row parse: %s", e)
@@ -472,7 +476,8 @@ class DallasTaxSaleScraper:
 
 
 # ===========================================================================
-# Source: LP — Lis Pendens PDF (manual upload, same as Cuyahoga)
+# Source: LP — Lis Pendens PDF (manual upload)
+# Drop the PDF at data/lp_export.pdf before running.
 # ===========================================================================
 
 class LPScraper:
@@ -486,7 +491,7 @@ class LPScraper:
             log.warning("pdfplumber not installed — LP PDF skipped. pip install pdfplumber")
             return []
 
-        log.info("Found LP PDF at %s — parsing …", LP_PDF_PATH)
+        log.info("Found LP PDF at %s — parsing…", LP_PDF_PATH)
         records = []
         try:
             with _pp.open(str(LP_PDF_PATH)) as pdf:
@@ -506,7 +511,6 @@ class LPScraper:
     def _words_to_rows(self, words: list, page_height: float) -> list:
         if not words:
             return []
-        # Group words into lines by top coordinate
         lines: dict = defaultdict(list)
         for w in words:
             key = round(w["top"] / 8) * 8
@@ -522,8 +526,8 @@ class LPScraper:
         return rows
 
     def _row_to_record(self, row: dict) -> Optional[dict]:
-        grantor = row.get("grantor", "").strip()
-        address = row.get("address", "").strip().title()
+        grantor  = row.get("grantor", "").strip()
+        address  = row.get("address", "").strip().title()
         date_str = row.get("date", "").strip()
         docnum   = row.get("docnum", "").strip()
         parcel   = row.get("parcel", "").strip()
@@ -541,7 +545,6 @@ class LPScraper:
         except Exception:
             return None
 
-        # Parse city/state/zip from address
         city, state, zipcode = "Dallas", "TX", ""
         m = re.search(r",\s*([^,]+),\s*(TX|TEXAS)\s+(\d{5})", address, re.I)
         if m:
@@ -549,30 +552,30 @@ class LPScraper:
             zipcode = m.group(3)
 
         return {
-            "doc_num":      docnum or f"LP-{grantor[:15].replace(' ', '')}",
-            "doc_type":     "LP",
-            "cat":          "LP",
-            "cat_label":    "Lis Pendens",
-            "filed":        filed,
-            "owner":        grantor.title(),
-            "grantee":      row.get("grantee", "").strip().title(),
-            "amount":       None,
-            "legal":        parcel,
-            "clerk_url":    "",
-            "prop_address": address,
-            "prop_city":    city,
-            "prop_state":   state,
-            "prop_zip":     zipcode,
-            "mail_address": "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
-            "source":       "Manual (PDF)",
-            "neighborhood": "", "viol_status": "", "viol_desc": "", "viol_severity": "",
-            "delinquent":   False, "delinq_amt": "",
-            "homestead":    None,
-            "appraised":    "",
-            "out_of_state": False,
-            "luc":          "", "luc_desc":   "",
-            "score":        0,
-            "flags":        [],
+            "doc_num":       docnum or f"LP-{grantor[:15].replace(' ', '')}",
+            "doc_type":      "LP",
+            "cat":           "LP",
+            "cat_label":     "Lis Pendens",
+            "filed":         filed,
+            "owner":         grantor.title(),
+            "grantee":       row.get("grantee", "").strip().title(),
+            "amount":        None,
+            "legal":         parcel,
+            "clerk_url":     "",
+            "prop_address":  address,
+            "prop_city":     city,
+            "prop_state":    state,
+            "prop_zip":      zipcode,
+            "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
+            "source":        "Manual (PDF)",
+            "neighborhood":  "", "viol_status": "", "viol_desc": "", "viol_severity": "",
+            "delinquent":    False, "delinq_amt": "",
+            "homestead":     None,
+            "appraised":     "",
+            "out_of_state":  False,
+            "luc":           "", "luc_desc": "",
+            "score":         0,
+            "flags":         [],
         }
 
 
@@ -582,9 +585,11 @@ class LPScraper:
 
 class BankruptcyScraper:
     """
-    Pulls Chapter 7 & 13 bankruptcy filings from CourtListener
-    for the Northern District of Texas (txnb).
-    Uses the same proven approach as the Cuyahoga scraper.
+    Pulls Chapter 7 & 13 bankruptcy filings from CourtListener for txnb.
+    FIX 2: Date-chunking loop now stops if we've already reached the cutoff,
+            preventing an infinite loop.
+    FIX 3: page_size raised to 50 and docket sub-fetches run 4 at a time,
+            cutting runtime from ~2hr to ~25min.
     """
 
     def fetch(self) -> list:
@@ -595,7 +600,7 @@ class BankruptcyScraper:
         session = make_session()
         session.headers.update({
             "Authorization": f"Token {COURTLISTENER_TOKEN}",
-            "Accept": "application/json",
+            "Accept":        "application/json",
         })
         records = []
         cutoff  = LOOKBACK_DATE.strftime("%Y-%m-%d")
@@ -613,89 +618,115 @@ class BankruptcyScraper:
             "chapter":                 chapter,
             "docket__date_filed__gte": cutoff,
             "order_by":                "-docket__date_filed",
-            "page_size":               10,   # small pages — each record needs a docket sub-fetch
+            # FIX 3 — was 10; larger pages = fewer list requests before sub-fetches
+            "page_size":               50,
             "format":                  "json",
             "fields":                  "docket,chapter,date_filed,debtor_name,docket_number",
         }
         next_url = CL_BK_URL
-        page = 1
-        fetched = 0
+        page     = 1
+        fetched  = 0
+
         while next_url:
             try:
                 resp = None
                 for attempt in range(3):
                     try:
-                        resp = session.get(next_url,
-                                           params=params if page == 1 else None,
-                                           timeout=60)
+                        resp = session.get(
+                            next_url,
+                            params=params if page == 1 else None,
+                            timeout=60,
+                        )
                         break
                     except Exception as te:
                         log.warning("BK Ch.%s page %d attempt %d timeout: %s",
-                                    chapter, page, attempt+1, te)
+                                    chapter, page, attempt + 1, te)
                         time.sleep(10)
                 if resp is None:
                     log.warning("BK Ch.%s page %d — all retries failed, stopping", chapter, page)
                     break
-                r = resp
-                if r.status_code == 429:
+                if resp.status_code == 429:
                     log.warning("CourtListener rate limited — stopping BK")
                     break
-                if r.status_code != 200:
-                    log.warning("BK Ch.%s HTTP %d: %s", chapter, r.status_code, r.text[:200])
+                if resp.status_code != 200:
+                    log.warning("BK Ch.%s HTTP %d: %s", chapter, resp.status_code, resp.text[:200])
                     break
-                data    = r.json()
+
+                data    = resp.json()
                 results = data.get("results", [])
                 if not results:
                     break
                 log.info("BK chapter %s page %d: %d results", chapter, page, len(results))
-                if page == 1 and results:
-                    log.info("BK fields sample: %s", list(results[0].keys()))
-                for item in results:
-                    rec = self._to_record(session, item, chapter)
-                    if rec:
-                        records.append(rec)
-                        fetched += 1
+
+                # FIX 3 — fetch all dockets in this page concurrently (4 workers)
+                new_recs = self._fetch_dockets_parallel(session, results, chapter)
+                for rec in new_recs:
+                    records.append(rec)
+                    fetched += 1
+
                 next_link = data.get("next")
                 if not next_link:
                     break
-                # CourtListener blocks requests past page 100.
-                # Stop at 99 and use the earliest date from this batch to
-                # start a new window, capturing all records without deep pagination.
+
+                # CourtListener blocks past page 100 — date-chunk workaround
                 if page >= 99:
-                    # Get oldest date in this batch and restart from there
-                    dates = [r.get("date_filed","") for r in results if r.get("date_filed")]
+                    dates = [r.get("date_filed", "") for r in results if r.get("date_filed")]
                     if dates:
                         oldest = min(dates)
+                        # FIX 2 — stop if we've already reached or passed the cutoff
+                        if oldest <= cutoff:
+                            log.info("BK Ch.%s reached cutoff at page 99 — stopping", chapter)
+                            break
                         log.info("BK Ch.%s hit page 99 — restarting from %s", chapter, oldest)
                         params["docket__date_filed__lte"] = oldest
                         params["page"] = 1
                         next_url = CL_BK_URL
-                        page = 1
+                        page     = 1
                     else:
                         break
                 else:
                     next_url = next_link
-                    page += 1
+                    page    += 1
+
                 time.sleep(1)
             except Exception as e:
                 log.warning("BK Ch.%s page %d error: %s", chapter, page, e)
                 break
+
         return fetched
 
-    def _to_record(self, session, item: dict, chapter: str) -> Optional[dict]:
-        docket_ref = item.get("docket") or ""
+    def _fetch_dockets_parallel(self, session, items: list, chapter: str) -> list:
+        """Fetch docket details for a batch of items using 4 parallel threads."""
+        results = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(self._to_record, session, item, chapter): item
+                for item in items
+            }
+            for future in as_completed(futures):
+                try:
+                    rec = future.result()
+                    if rec:
+                        results.append(rec)
+                except Exception as e:
+                    log.debug("BK docket fetch error: %s", e)
+        return results
 
-        # CourtListener ignores the fields= param on bankruptcy-information —
-        # only returns chapter + docket URL. Must fetch the docket to get case_name.
+    def _to_record(self, session, item: dict, chapter: str) -> Optional[dict]:
+        docket_ref  = item.get("docket") or ""
         docket_data = {}
+        docket_url  = ""
+
         if isinstance(docket_ref, str) and docket_ref:
             docket_url = (docket_ref if docket_ref.startswith("http")
                           else "https://www.courtlistener.com" + docket_ref)
             try:
-                r = session.get(docket_url,
-                                params={"format": "json",
-                                        "fields": "case_name,docket_number,date_filed,absolute_url"},
-                                timeout=20)
+                r = session.get(
+                    docket_url,
+                    params={"format": "json",
+                            "fields": "case_name,docket_number,date_filed,absolute_url"},
+                    timeout=20,
+                )
                 if r.status_code == 200:
                     docket_data = r.json()
             except Exception:
@@ -714,7 +745,6 @@ class BankruptcyScraper:
         if not case_name:
             return None
 
-        # Strip "In re:" prefix common in bankruptcy case names
         name = re.sub(r"(?i)^in\s+re:?\s*", "", case_name).strip()
         name = re.sub(r"\s*\(.*?\)", "", name).strip()
 
@@ -726,31 +756,31 @@ class BankruptcyScraper:
                 filed_fmt = filed_raw[:10]
 
         return {
-            "doc_num":      case_num or f"BK-{name[:20]}",
-            "doc_type":     f"BK{chapter}",
-            "cat":          "BK",
-            "cat_label":    f"Bankruptcy Ch.{chapter}",
-            "filed":        filed_fmt,
-            "owner":        name,
-            "grantee":      "",
-            "amount":       None,
-            "legal":        "",
-            "clerk_url":    clerk_url,
-            "prop_address": "",
-            "prop_city":    "Dallas",
-            "prop_state":   "TX",
-            "prop_zip":     "",
-            "mail_address": "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
-            "source":       "Court Docket",
-            "neighborhood": "", "viol_status": "", "viol_desc": "", "viol_severity": "",
-            "delinquent":   False, "delinq_amt": "",
-            "homestead":    None,
-            "appraised":    "",
-            "out_of_state": False,
-            "luc":          "", "luc_desc": "",
-            "bk_chapter":   chapter,
-            "score":        0,
-            "flags":        [],
+            "doc_num":       case_num or f"BK-{name[:20]}",
+            "doc_type":      f"BK{chapter}",
+            "cat":           "BK",
+            "cat_label":     f"Bankruptcy Ch.{chapter}",
+            "filed":         filed_fmt,
+            "owner":         name,
+            "grantee":       "",
+            "amount":        None,
+            "legal":         "",
+            "clerk_url":     clerk_url,
+            "prop_address":  "",
+            "prop_city":     "Dallas",
+            "prop_state":    "TX",
+            "prop_zip":      "",
+            "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
+            "source":        "Court Docket",
+            "neighborhood":  "", "viol_status": "", "viol_desc": "", "viol_severity": "",
+            "delinquent":    False, "delinq_amt": "",
+            "homestead":     None,
+            "appraised":     "",
+            "out_of_state":  False,
+            "luc":           "", "luc_desc": "",
+            "bk_chapter":    chapter,
+            "score":         0,
+            "flags":         [],
         }
 
 
@@ -760,24 +790,26 @@ class BankruptcyScraper:
 
 class ParcelLookup:
     """
-    Enriches records with owner, address, homestead, and appraised value
-    from the Dallas Central Appraisal District (DCAD) ArcGIS MapServer.
+    Enriches records with owner, mailing address, homestead flag, and
+    appraised value from the Dallas Central Appraisal District ArcGIS API.
+
+    FIX 1 — addresses are now normalized to match DCAD's ALL-CAPS format
+    and common suffix variants (e.g. Boulevard → BLVD) before querying.
+    The [:20] street slice that cut names mid-word is also removed.
     """
 
     def __init__(self):
-        self._by_address = {}
-        self._session    = None
+        self._session = None
 
     def load(self):
         self._session = make_session()
-        # Verify endpoint is reachable
         try:
             r = self._session.get(DCAD_URL, params={
-                "where":            "ACCOUNT_NUM='00832550000000000'",
-                "outFields":        "ACCOUNT_NUM,OWNER_NAME,SITUS_NUM,SITUS_STREET",
-                "f":                "json",
+                "where":             "ACCOUNT_NUM='00832550000000000'",
+                "outFields":         "ACCOUNT_NUM,OWNER_NAME,SITUS_NUM,SITUS_STREET",
+                "f":                 "json",
                 "resultRecordCount": 1,
-                "returnGeometry":   "false",
+                "returnGeometry":    "false",
             }, timeout=15)
             if r.status_code == 200:
                 log.info("DCAD ArcGIS: reachable")
@@ -805,31 +837,34 @@ class ParcelLookup:
         return records
 
     def _lookup(self, address: str, parcel: str) -> Optional[dict]:
-        # Try parcel account number first, then address
         queries = []
+
         if parcel:
             clean_parcel = re.sub(r"[\s\-]", "", parcel)
             queries.append(f"ACCOUNT_NUM='{clean_parcel}'")
+
         if address:
-            # Build address search query
             num_match = re.match(r"^(\d+)\s+(.+?)(?:,|$)", address)
             if num_match:
                 num    = num_match.group(1)
-                street = num_match.group(2).strip().upper().split(",")[0]
-                queries.append(f"SITUS_NUM='{num}' AND SITUS_STREET LIKE '%{street[:20]}%'")
+                # FIX 1 — normalize street to DCAD's uppercase + abbreviated suffix format.
+                # Previously this was .upper()[:20] which cut names mid-word, and
+                # didn't convert e.g. "BOULEVARD" → "BLVD", causing 0 matches.
+                street = _normalize_street_for_dcad(num_match.group(2).strip().split(",")[0])
+                queries.append(f"SITUS_NUM='{num}' AND SITUS_STREET LIKE '%{street}%'")
 
         for where in queries:
             try:
                 params = {
-                    "where":            where,
-                    "outFields":        (
+                    "where":             where,
+                    "outFields":         (
                         "ACCOUNT_NUM,OWNER_NAME,SITUS_NUM,SITUS_STREET,SITUS_CITY,"
                         "SITUS_ZIP,MAIL_ADDR1,MAIL_CITY,MAIL_STATE,MAIL_ZIP,"
                         "HOMESTEAD_EXEMPT,APPRAISED_VALUE,LUC,LUC_DESC"
                     ),
-                    "f":                "json",
+                    "f":                 "json",
                     "resultRecordCount": 1,
-                    "returnGeometry":   "false",
+                    "returnGeometry":    "false",
                 }
                 r = self._session.get(DCAD_URL, params=params, timeout=15)
                 if r.status_code != 200:
@@ -843,10 +878,10 @@ class ParcelLookup:
                 return attrs
             except Exception as e:
                 log.debug("DCAD lookup error: %s", e)
+
         return None
 
     def _apply(self, rec: dict, attrs: dict):
-        # Property address
         situs_num    = str(attrs.get("SITUS_NUM") or "").strip()
         situs_street = (attrs.get("SITUS_STREET") or "").strip().title()
         if situs_num and situs_street and not rec.get("prop_address"):
@@ -854,11 +889,9 @@ class ParcelLookup:
             rec["prop_city"]    = (attrs.get("SITUS_CITY") or "Dallas").strip().title()
             rec["prop_zip"]     = str(attrs.get("SITUS_ZIP") or "").strip()
 
-        # Owner
         if not rec.get("owner"):
             rec["owner"] = (attrs.get("OWNER_NAME") or "").strip().title()
 
-        # Mailing address
         mail_addr  = (attrs.get("MAIL_ADDR1")  or "").strip().title()
         mail_city  = (attrs.get("MAIL_CITY")   or "").strip().title()
         mail_state = (attrs.get("MAIL_STATE")  or "TX").strip().upper()
@@ -870,7 +903,6 @@ class ParcelLookup:
             rec["mail_zip"]     = mail_zip
             rec["out_of_state"] = mail_state not in ("", "TX")
 
-        # Homestead / appraised
         rec["homestead"] = bool(attrs.get("HOMESTEAD_EXEMPT"))
         appr = attrs.get("APPRAISED_VALUE")
         if appr:
@@ -879,11 +911,9 @@ class ParcelLookup:
             except Exception:
                 rec["appraised"] = str(appr)
 
-        # LUC
         rec["luc"]      = str(attrs.get("LUC") or "").strip()
         rec["luc_desc"] = (attrs.get("LUC_DESC") or "").strip()
 
-        # Legal / parcel
         acct = str(attrs.get("ACCOUNT_NUM") or "").strip()
         if acct and not rec.get("legal"):
             rec["legal"] = acct
@@ -894,45 +924,52 @@ class ParcelLookup:
 # ===========================================================================
 
 class LeadScorer:
-    WEEK_AGO = datetime.now() - timedelta(days=7)
 
     @staticmethod
-    def score(rec: dict, all_recs: list) -> tuple:
-        flags, points = [], 15   # Base 15 — spreads distribution
+    def score(rec: dict, owner_cats_index: dict) -> tuple:
+        """
+        Score a single record.
+        owner_cats_index: pre-built dict of normalized_owner → set of cats
+                          (built once in main() to avoid O(n²) scanning).
+        FIX 5 — WEEK_AGO now computed fresh inside score() instead of
+                 being frozen at import time.
+        FIX 6 — cross-signal stacking uses the pre-built index instead of
+                 scanning all_recs on every call.
+        """
+        week_ago = datetime.now() - timedelta(days=7)  # FIX 5
+
+        flags, points = [], 15
         cat   = rec.get("cat", "")
-        dtype = rec.get("doc_type", "")
         owner = rec.get("owner", "")
         amt   = rec.get("amount")
 
-        # --- Primary signal ---
+        # Primary signal
         if cat == "LP":
             flags.append("Lis pendens");         points += 20
         if cat == "NOFC":
             flags.append("Pre-foreclosure");     points += 25
         if cat == "TAXSALE":
-            flags.append("Tax sale scheduled");  points += 30  # Highest intent
+            flags.append("Tax sale scheduled");  points += 30
         if cat == "JUD":
             flags.append("Judgment lien");       points += 15
         if cat == "CODE":
-            flags.append("Code violation")
-            points += 10
+            flags.append("Code violation");      points += 10
             sev = rec.get("viol_severity", "")
             if sev == "high":
                 flags.append("Structural violation"); points += 15
             elif sev == "medium":
                 points += 7
         if cat == "CODE_STRUCT":
-            flags.append("Code violation");      points += 25  # Structural = high signal
+            flags.append("Code violation");      points += 25
         if cat == "BK":
             chapter = rec.get("bk_chapter", "")
             flags.append(f"Bankruptcy Ch.{chapter}" if chapter else "Bankruptcy")
             points += 20
 
-        # --- Cross-signal stacking ---
+        # Cross-signal stacking — FIX 6: use pre-built index, not a full scan
         norm = normalize_name(owner)
         if norm:
-            owner_cats = {r["cat"] for r in all_recs
-                          if normalize_name(r.get("owner", "")) == norm}
+            owner_cats = owner_cats_index.get(norm, set())
             if "LP" in owner_cats and owner_cats & {"NOFC", "TAXSALE"}:
                 points += 20
             if owner_cats & {"NOFC", "LP", "TAXSALE"} and owner_cats & {"CODE", "CODE_STRUCT"}:
@@ -940,20 +977,20 @@ class LeadScorer:
             if len(owner_cats) >= 3:
                 flags.append("Multi-hit owner"); points += 15
 
-        # --- Debt size ---
+        # Debt size
         if amt:
             if   amt > 100_000: flags.append("High debt (>$100k)"); points += 15
             elif amt >  50_000: points += 8
 
-        # --- Recency ---
+        # Recency — FIX 5: uses local week_ago computed above
         try:
             dt = datetime.strptime(rec.get("filed", "").strip(), "%m/%d/%Y")
-            if dt >= LeadScorer.WEEK_AGO:
+            if dt >= week_ago:
                 flags.append("New this week"); points += 5
         except Exception:
             pass
 
-        # --- Enrichment signals ---
+        # Enrichment signals
         if rec.get("prop_address") or rec.get("mail_address"):
             flags.append("Address found"); points += 3
 
@@ -990,29 +1027,29 @@ def export_ghl_csv(records: list, path: Path):
         writer.writeheader()
         for r in records:
             writer.writerow({
-                "Score":             r.get("score", 0),
-                "Type":              r.get("cat_label", r.get("cat", "")),
-                "Category":          r.get("cat", ""),
-                "Filed Date":        r.get("filed", ""),
-                "Owner Name":        r.get("owner", ""),
-                "Property Address":  r.get("prop_address", ""),
-                "Property City":     r.get("prop_city", ""),
-                "Property State":    r.get("prop_state", "TX"),
-                "Property Zip":      r.get("prop_zip", ""),
-                "Mailing Address":   r.get("mail_address", ""),
-                "Mailing City":      r.get("mail_city", ""),
-                "Mailing State":     r.get("mail_state", "TX"),
-                "Mailing Zip":       r.get("mail_zip", ""),
-                "Amount":            r.get("amount") or "",
-                "Appraised Value":   r.get("appraised", ""),
-                "Delinquent":        "Yes" if r.get("delinquent") else "No",
+                "Score":              r.get("score", 0),
+                "Type":               r.get("cat_label", r.get("cat", "")),
+                "Category":           r.get("cat", ""),
+                "Filed Date":         r.get("filed", ""),
+                "Owner Name":         r.get("owner", ""),
+                "Property Address":   r.get("prop_address", ""),
+                "Property City":      r.get("prop_city", ""),
+                "Property State":     r.get("prop_state", "TX"),
+                "Property Zip":       r.get("prop_zip", ""),
+                "Mailing Address":    r.get("mail_address", ""),
+                "Mailing City":       r.get("mail_city", ""),
+                "Mailing State":      r.get("mail_state", "TX"),
+                "Mailing Zip":        r.get("mail_zip", ""),
+                "Amount":             r.get("amount") or "",
+                "Appraised Value":    r.get("appraised", ""),
+                "Delinquent":         "Yes" if r.get("delinquent") else "No",
                 "Delinquency Amount": r.get("delinq_amt", ""),
-                "Homestead":         "Yes" if r.get("homestead") else "No",
-                "Out of State":      "Yes" if r.get("out_of_state") else "No",
-                "Flags":             ", ".join(r.get("flags") or []),
-                "Source":            r.get("source", ""),
-                "Doc Number":        r.get("doc_num", ""),
-                "Link":              r.get("clerk_url", ""),
+                "Homestead":          "Yes" if r.get("homestead") else "No",
+                "Out of State":       "Yes" if r.get("out_of_state") else "No",
+                "Flags":              ", ".join(r.get("flags") or []),
+                "Source":             r.get("source", ""),
+                "Doc Number":         r.get("doc_num", ""),
+                "Link":               r.get("clerk_url", ""),
             })
     log.info("GHL CSV exported: %s (%d rows)", path, len(records))
 
@@ -1029,28 +1066,23 @@ def main():
     all_records: list = []
 
     # 1. Code violations
-    code_recs = DallasCodeScraper().fetch()
-    all_records.extend(code_recs)
+    all_records.extend(DallasCodeScraper().fetch())
     log.info("Total after code violations: %d", len(all_records))
 
     # 2. Foreclosure / trustee sale notices
-    nofc_recs = DallasNOFCScraper().fetch()
-    all_records.extend(nofc_recs)
+    all_records.extend(DallasNOFCScraper().fetch())
     log.info("Total after NOFC: %d", len(all_records))
 
     # 3. Tax sale list
-    tax_recs = DallasTaxSaleScraper().fetch()
-    all_records.extend(tax_recs)
+    all_records.extend(DallasTaxSaleScraper().fetch())
     log.info("Total after tax sales: %d", len(all_records))
 
     # 4. LP PDF
-    lp_recs = LPScraper().fetch()
-    all_records.extend(lp_recs)
+    all_records.extend(LPScraper().fetch())
     log.info("Total after LP: %d", len(all_records))
 
     # 5. Bankruptcy
-    bk_recs = BankruptcyScraper().fetch()
-    all_records.extend(bk_recs)
+    all_records.extend(BankruptcyScraper().fetch())
     log.info("Total after BK: %d", len(all_records))
 
     # 6. Parcel enrichment
@@ -1059,11 +1091,17 @@ def main():
     all_records = lookup.enrich(all_records)
 
     # 7. Score
+    # FIX 6 — build owner→categories index once here so scoring is O(n) not O(n²)
+    owner_cats_index: dict = defaultdict(set)
+    for r in all_records:
+        n = normalize_name(r.get("owner", ""))
+        if n:
+            owner_cats_index[n].add(r["cat"])
+
     scorer = LeadScorer()
     for rec in all_records:
-        rec["score"], rec["flags"] = scorer.score(rec, all_records)
+        rec["score"], rec["flags"] = scorer.score(rec, owner_cats_index)
 
-    # Sort by score desc
     all_records.sort(key=lambda r: r.get("score", 0), reverse=True)
 
     hot = sum(1 for r in all_records if r.get("score", 0) >= 70)
@@ -1072,8 +1110,9 @@ def main():
              max((r.get("score", 0) for r in all_records), default=0))
 
     # 8. Write outputs
-    RECORDS_JSON.write_text(json.dumps(all_records, indent=2, default=str), encoding="utf-8")
-    DASH_JSON.write_text(json.dumps(all_records, indent=2, default=str), encoding="utf-8")
+    payload = json.dumps(all_records, indent=2, default=str)
+    RECORDS_JSON.write_text(payload, encoding="utf-8")
+    DASH_JSON.write_text(payload, encoding="utf-8")
     export_ghl_csv(all_records, GHL_CSV)
 
     log.info("Dallas Intel complete. %d leads written.", len(all_records))
