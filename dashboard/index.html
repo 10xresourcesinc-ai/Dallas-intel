@@ -464,7 +464,7 @@ function render() {
     const link   = r.clerk_url
       ? `<a href="${r.clerk_url}" target="_blank" onclick="event.stopPropagation()"
            style="color:var(--accent);font-size:16px;text-decoration:none">↗</a>` : "";
-    return `<tr onclick="showDetail(${i},${JSON.stringify(rows).replace(/"/g,'&quot;')})">
+    return `<tr onclick="showDetail(${i})">
       <td><span class="score-badge ${sCls}">${score}</span></td>
       <td>
         <span class="type-badge ${catCls}">${r.cat||""}</span>
@@ -566,7 +566,8 @@ function clearPDFs() {
 // -----------------------------------------------------------------------
 // Detail Modal
 // -----------------------------------------------------------------------
-function showDetail(idx, rows) {
+function showDetail(idx) {
+  const rows = window._filteredRows || allRecords();
   const r = rows[idx];
   document.getElementById("modal-title").textContent = r.owner || "Lead Detail";
   const fields = [
