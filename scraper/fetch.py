@@ -399,79 +399,177 @@ class DallasNOFCScraper:
 # ===========================================================================
 
 class DallasTaxSaleScraper:
+    """
+    Pulls Dallas-area tax sale properties from the LGBS map API.
+    The site is a JS app but loads property data from a /map endpoint
+    discovered via Network tab — returns JSON with full property details.
+    Paginates using offset in steps of 50 until all records are fetched.
+    """
+
+    # Dallas county bounding box center — same coords the site uses
+    API_URL  = "https://taxsales.lgbs.com/map"
+    LAT      = 32.76778503344948
+    LON      = -96.77737047966386
+    ZOOM     = 10
+    PAGE     = 50
+
+    # Dallas-area county names to filter for (site covers all of Texas)
+    DALLAS_COUNTIES = {"dallas", "collin", "denton", "tarrant", "rockwall",
+                       "kaufman", "ellis", "johnson"}
+
     def fetch(self) -> list:
-        log.info("Scraping Dallas tax sale list (LGBS)…")
+        log.info("Scraping LGBS tax sale list via map API…")
         session = make_session()
+        # Mimic a real browser — the site checks headers
+        session.headers.update({
+            "Accept":          "application/json, text/plain, */*",
+            "Referer":         "https://taxsales.lgbs.com/",
+            "Origin":          "https://taxsales.lgbs.com",
+        })
         records = []
+        offset  = 0
 
-        try:
-            r = session.get(LGBS_TAXSALE_URL, timeout=30)
-            if r.status_code != 200:
-                log.warning("LGBS HTTP %d", r.status_code)
-                return []
-            soup = BeautifulSoup(r.text, "lxml")
-            rows = soup.select("table tr, .property-row")
-            log.info("Tax sale rows: %d", len(rows))
-            for row in rows:
-                rec = self._parse_row(row)
-                if rec:
-                    records.append(rec)
-        except Exception as e:
-            log.warning("Tax sale error: %s", e)
+        while True:
+            try:
+                params = {
+                    "lat":       self.LAT,
+                    "lon":       self.LON,
+                    "zoom":      self.ZOOM,
+                    "offset":    offset,
+                    "ordering":  "sale_date,street_name,address_full,uid",
+                    "sale_type": "SALE,RESALE",
+                    "limit":     self.PAGE,
+                }
+                r = session.get(self.API_URL, params=params, timeout=30)
+                if r.status_code != 200:
+                    log.warning("LGBS API HTTP %d — %s", r.status_code, r.text[:200])
+                    break
 
-        log.info("Tax sale: %d records", len(records))
+                # Response is JSON with a results array
+                try:
+                    data = r.json()
+                except Exception:
+                    log.warning("LGBS API returned non-JSON — site may be blocking")
+                    break
+
+                # Handle both {"results": [...]} and bare list responses
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    items = data.get("results") or data.get("properties") or []
+                else:
+                    break
+
+                if not items:
+                    break
+
+                log.info("LGBS offset %d: %d items", offset, len(items))
+                for item in items:
+                    # Filter to Dallas metro only
+                    county = (item.get("county") or "").lower().strip()
+                    if county and county not in self.DALLAS_COUNTIES:
+                        continue
+                    rec = self._to_record(item)
+                    if rec:
+                        records.append(rec)
+
+                if len(items) < self.PAGE:
+                    break  # last page
+                offset += self.PAGE
+                time.sleep(0.5)
+
+            except Exception as e:
+                log.warning("LGBS fetch error at offset %d: %s", offset, e)
+                break
+
+        log.info("Tax sale: %d Dallas-area records", len(records))
         return records
 
-    def _parse_row(self, row) -> Optional[dict]:
+    def _to_record(self, item: dict) -> Optional[dict]:
         try:
-            cells = row.find_all(["td", "div"])
-            if len(cells) < 3:
-                return None
-            texts   = [c.get_text(strip=True) for c in cells]
-            suit_no = texts[0] if texts else ""
-            owner   = texts[1] if len(texts) > 1 else ""
-            address = texts[2] if len(texts) > 2 else ""
-            amount  = None
-            for t in texts:
-                m = re.search(r"\$([\d,]+)", t)
-                if m:
+            address_full = (item.get("address_full") or
+                            item.get("address") or "").strip().title()
+            street       = (item.get("street_name") or "").strip().title()
+            city         = (item.get("city") or
+                            item.get("municipality") or "Dallas").strip().title()
+            state        = (item.get("state") or "TX").strip().upper()
+            zipcode      = str(item.get("zip") or item.get("zip_code") or "").strip()
+            cause_num    = str(item.get("cause_number") or
+                               item.get("uid") or "").strip()
+            sale_date    = (item.get("sale_date") or "").strip()
+            sale_type    = (item.get("sale_type") or "SALE").strip()
+            adj_value    = item.get("adjudged_value") or item.get("adjudged_val")
+            min_bid      = item.get("minimum_bid") or item.get("min_bid")
+            geo_id       = str(item.get("geo_id") or
+                               item.get("account_number") or "").strip()
+            precinct     = str(item.get("precinct") or "").strip()
+            status       = (item.get("status") or "").strip()
+
+            # Parse sale date
+            filed = ""
+            if sale_date:
+                for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%m/%d/%Y"):
                     try:
-                        amount = float(m.group(1).replace(",", ""))
+                        filed = datetime.strptime(sale_date[:19], fmt).strftime("%m/%d/%Y")
+                        break
+                    except Exception:
+                        continue
+
+            # Use minimum bid as the amount (most relevant for investors)
+            amount = None
+            for val in (min_bid, adj_value):
+                if val:
+                    try:
+                        amount = float(str(val).replace(",", "").replace("$", ""))
+                        break
                     except Exception:
                         pass
-                    break
-            if not suit_no and not owner:
+
+            appraised = ""
+            if adj_value:
+                try:
+                    appraised = f"${float(str(adj_value).replace(',','').replace('$','')):,.0f}"
+                except Exception:
+                    appraised = str(adj_value)
+
+            if not address_full and not cause_num:
                 return None
+
+            clerk_url = (f"https://taxsales.lgbs.com/?cause={cause_num}"
+                         if cause_num else "https://taxsales.lgbs.com/")
+
             return {
-                "doc_num":       f"TAXSALE-{suit_no}",
-                "doc_type":      "TAXSALE",
+                "doc_num":       f"TAXSALE-{cause_num}" if cause_num else "TAXSALE",
+                "doc_type":      f"TAXSALE-{sale_type}",
                 "cat":           "TAXSALE",
                 "cat_label":     "Tax Sale",
-                "filed":         date.today().strftime("%m/%d/%Y"),
-                "owner":         owner.strip().title(),
+                "filed":         filed,
+                "owner":         "",   # LGBS doesn't expose owner name in list view
                 "grantee":       "Dallas County",
                 "amount":        amount,
-                "legal":         "",
-                "clerk_url":     LGBS_TAXSALE_URL,
-                "prop_address":  address.strip().title(),
-                "prop_city":     "Dallas",
-                "prop_state":    "TX",
-                "prop_zip":      "",
+                "legal":         geo_id,
+                "clerk_url":     clerk_url,
+                "prop_address":  address_full or street,
+                "prop_city":     city,
+                "prop_state":    state,
+                "prop_zip":      zipcode,
                 "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
                 "source":        "Tax Sale List",
-                "neighborhood":  "", "viol_status": "", "viol_desc": "",
-                "viol_severity": "",
+                "neighborhood":  precinct,
+                "viol_status":   status,
+                "viol_desc":     f"Tax sale — {sale_type}",
+                "viol_severity": "high",
                 "delinquent":    True,
                 "delinq_amt":    f"{amount:,.2f}" if amount else "",
                 "homestead":     None,
-                "appraised":     "",
+                "appraised":     appraised,
                 "out_of_state":  False,
                 "luc":           "", "luc_desc": "",
                 "score":         0,
                 "flags":         [],
             }
         except Exception as e:
-            log.debug("Tax sale row parse: %s", e)
+            log.debug("LGBS record parse error: %s", e)
             return None
 
 
