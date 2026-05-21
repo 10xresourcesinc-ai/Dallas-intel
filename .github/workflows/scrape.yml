@@ -42,7 +42,8 @@ jobs:
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '30' }}
           PYTHONUNBUFFERED: "1"
           COURTLISTENER_TOKEN: ${{ secrets.COURTLISTENER_TOKEN }}
-        run: & "C:\Users\gokoo\AppData\Local\Python\pythoncore-3.14-64\python.exe" scraper/fetch.py
+        run: |
+          & "C:\Users\gokoo\AppData\Local\Python\pythoncore-3.14-64\python.exe" scraper/fetch.py
         shell: powershell
 
       - name: Commit and push records
