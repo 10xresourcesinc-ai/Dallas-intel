@@ -19,6 +19,8 @@ jobs:
   scrape:
     name: Scrape & Export Leads
     runs-on: self-hosted
+    env:
+      PYTHON: C:\Users\gokoo\AppData\Local\Python\pythoncore-3.14-64\python.exe
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -27,8 +29,8 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r scraper/requirements.txt
+          $env:PYTHON -m pip install --upgrade pip
+          $env:PYTHON -m pip install -r scraper/requirements.txt
 
       - name: Create output directories
         run: |
@@ -40,7 +42,7 @@ jobs:
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '30' }}
           PYTHONUNBUFFERED: "1"
           COURTLISTENER_TOKEN: ${{ secrets.COURTLISTENER_TOKEN }}
-        run: python scraper/fetch.py
+        run: $env:PYTHON scraper/fetch.py
 
       - name: Commit and push records
         run: |
