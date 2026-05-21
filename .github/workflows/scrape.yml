@@ -19,8 +19,6 @@ jobs:
   scrape:
     name: Scrape & Export Leads
     runs-on: self-hosted
-    env:
-      PYTHON: C:\Users\gokoo\AppData\Local\Python\pythoncore-3.14-64\python.exe
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,29 +27,33 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          $env:PYTHON -m pip install --upgrade pip
-          $env:PYTHON -m pip install -r scraper/requirements.txt
+          & "C:\Users\gokoo\AppData\Local\Python\pythoncore-3.14-64\python.exe" -m pip install --upgrade pip
+          & "C:\Users\gokoo\AppData\Local\Python\pythoncore-3.14-64\python.exe" -m pip install -r scraper/requirements.txt
+        shell: powershell
 
       - name: Create output directories
         run: |
-          mkdir -p dashboard
-          mkdir -p data
+          New-Item -ItemType Directory -Force -Path dashboard
+          New-Item -ItemType Directory -Force -Path data
+        shell: powershell
 
       - name: Run scraper
         env:
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '30' }}
           PYTHONUNBUFFERED: "1"
           COURTLISTENER_TOKEN: ${{ secrets.COURTLISTENER_TOKEN }}
-        run: $env:PYTHON scraper/fetch.py
+        run: & "C:\Users\gokoo\AppData\Local\Python\pythoncore-3.14-64\python.exe" scraper/fetch.py
+        shell: powershell
 
       - name: Commit and push records
         run: |
           git config --global user.name  "GitHub Actions"
           git config --global user.email "actions@github.com"
-          git add dashboard/records.json data/records.json data/ghl_export.csv || true
-          git diff --cached --quiet || git commit -m "chore: update leads $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git add dashboard/records.json data/records.json data/ghl_export.csv
+          $diff = git diff --cached --quiet; if ($LASTEXITCODE -ne 0) { git commit -m "chore: update leads $(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')" }
           git pull --rebase origin main
           git push
+        shell: powershell
 
   deploy-dashboard:
     name: Deploy Dashboard to GitHub Pages
