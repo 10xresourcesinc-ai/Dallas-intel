@@ -406,12 +406,13 @@ class DallasTaxSaleScraper:
     Paginates using offset in steps of 50 until all records are fetched.
     """
 
-    # Dallas county bounding box center — same coords the site uses
+    # Exact parameters from browser Network tab — Dallas metro bounding box
     API_URL  = "https://taxsales.lgbs.com/map"
-    LAT      = 32.76778503344948
-    LON      = -96.77737047966386
+    LAT      = 32.81874118033135
+    LON      = -96.732096
     ZOOM     = 10
     PAGE     = 50
+    IN_BBOX  = "-97.40638188867187,32.46198950912711,-96.05781011132812,33.174066019764034"
 
     # Dallas-area county names to filter for (site covers all of Texas)
     DALLAS_COUNTIES = {"dallas", "collin", "denton", "tarrant", "rockwall",
@@ -436,9 +437,10 @@ class DallasTaxSaleScraper:
                     "lon":       self.LON,
                     "zoom":      self.ZOOM,
                     "offset":    offset,
-                    "ordering":  "sale_date,street_name,address_full,uid",
-                    "sale_type": "SALE,RESALE",
+                    "ordering":  "precinct,sale_nbr,uid",
+                    "sale_type": "SALE,RESALE,STRUCK OFF,FUTURE SALE",
                     "limit":     self.PAGE,
+                    "in_bbox":   self.IN_BBOX,
                 }
                 r = session.get(self.API_URL, params=params, timeout=30)
                 if r.status_code != 200:
