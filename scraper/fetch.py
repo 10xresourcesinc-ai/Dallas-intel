@@ -308,7 +308,7 @@ class DallasNOFCScraper:
                     continue
                 soup = BeautifulSoup(r.text, "lxml")
                 rows = soup.select("table.results-table tr, div.result-row, tr[data-id]")
-                log.info("NOFC %s → %d rows", doc_type, len(rows))
+                log.info("NOFC %s -> %d rows", doc_type, len(rows))
                 for row in rows:
                     rec = self._parse_row(row, doc_type)
                     if rec:
