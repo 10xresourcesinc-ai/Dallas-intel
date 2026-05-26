@@ -515,13 +515,10 @@ class DallasTaxSaleScraper:
     Paginates using offset in steps of 50 until all records are fetched.
     """
 
-    # Exact parameters from browser Network tab — Dallas metro bounding box
-    API_URL  = "https://taxsales.lgbs.com/map"
-    LAT      = 32.82286488974121
-    LON      = -96.78034507472077
-    ZOOM     = 10
+    # Real API endpoint discovered via Network tab — /api/property_sales/
+    API_URL  = "https://taxsales.lgbs.com/api/property_sales/"
     PAGE     = 50
-    IN_BBOX  = "-97.38939964015046,32.49972450731482,-96.17129050929108,33.144834006237964"
+    IN_BBOX  = "-97.40638188867187,32.46198950912711,-96.05781011132812,33.174066019764034"
 
     # Dallas-area county names to filter for (site covers all of Texas)
     DALLAS_COUNTIES = {"dallas", "collin", "denton", "tarrant", "rockwall",
