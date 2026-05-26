@@ -332,14 +332,19 @@ class DallasPublicSearchScraper:
                     if r.status_code != 200:
                         log.warning("PublicSearch %s HTTP %d", search_val, r.status_code)
                         break
-                    soup  = BeautifulSoup(r.text, "lxml")
-                    links = soup.select("a[href*='/doc/']")
-                    ids   = list({a["href"].split("/doc/")[1].split("?")[0]
-                                  for a in links if "/doc/" in a["href"]})
-                    log.info("PublicSearch '%s' offset %d: %d doc IDs (page len %d)",
-                             search_val, offset, len(ids), len(r.text))
-                    if len(ids) == 0 and len(r.text) < 5000:
-                        log.warning("PublicSearch short response: %s", r.text[:500])
+                    soup = BeautifulSoup(r.text, "lxml")
+                    rows = soup.select("tr[role='row']")
+                    log.info("PublicSearch '%s' offset %d: %d rows (page len %d)",
+                             search_val, offset, len(rows), len(r.text))
+
+                    for row in rows:
+                        rec = self._parse_row(row, cat, cat_label)
+                        if rec and rec["doc_num"] not in all_ids:
+                            all_ids[rec["doc_num"]] = rec
+
+                    ids = list(all_ids.keys())
+                    if len(rows) == 0:
+                        log.warning("PublicSearch no rows found. Snippet: %s", r.text[:300])
                     for doc_id in ids:
                         if doc_id not in all_ids:
                             all_ids[doc_id] = (cat, cat_label)
@@ -351,27 +356,78 @@ class DallasPublicSearchScraper:
                     log.warning("PublicSearch '%s' error: %s", search_val, e)
                     break
 
-        log.info("PublicSearch: %d unique doc IDs to fetch", len(all_ids))
-        if not all_ids:
-            return []
-
-        records = []
-        def fetch_doc(args):
-            doc_id, (cat, cat_label) = args
-            return self._fetch_doc(session, doc_id, cat, cat_label)
-
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            futs = {ex.submit(fetch_doc, item): item[0] for item in all_ids.items()}
-            for fut in as_completed(futs):
-                try:
-                    rec = fut.result()
-                    if rec:
-                        records.append(rec)
-                except Exception as e:
-                    log.debug("PublicSearch doc fetch error: %s", e)
-
-        log.info("PublicSearch: %d records fetched", len(records))
+        records = list(all_ids.values())
+        log.info("PublicSearch: %d records parsed from table", len(records))
         return records
+
+    def _parse_row(self, row, cat: str, cat_label: str) -> Optional[dict]:
+        """Parse a table row directly — all data is in col-0 through col-10."""
+        try:
+            # Doc ID from checkbox id: "table-checkbox-314313835"
+            chk = row.select_one("input[id^='table-checkbox-']")
+            if not chk:
+                return None
+            internal_id = chk["id"].replace("table-checkbox-", "").strip()
+
+            def col(n):
+                el = row.select_one(f".col-{n} span")
+                return el.get_text(strip=True) if el else ""
+
+            grantor  = col(3)
+            grantee  = col(4)
+            doc_type = col(5)
+            recorded = col(6)
+            doc_num  = col(7)
+            town     = col(9)
+            legal    = col(10)
+
+            if not grantor and not doc_num:
+                return None
+
+            # Parse date
+            filed = ""
+            try:
+                filed = datetime.strptime(recorded.strip(), "%m/%d/%Y").strftime("%m/%d/%Y")
+            except Exception:
+                filed = recorded[:10] if recorded else ""
+
+            # Extract address from legal description
+            address = ""
+            m = re.search(r"(\d+\s+\S+(?:\s+\S+){1,5}(?:ST|AVE|BLVD|DR|RD|LN|CT|WAY|PL|TRL|PKWY))",
+                          legal, re.I)
+            if m:
+                address = m.group(1).strip().title()
+
+            clerk_url = f"https://dallas.tx.publicsearch.us/doc/{internal_id}"
+
+            return {
+                "doc_num":       doc_num or internal_id,
+                "doc_type":      doc_type,
+                "cat":           cat,
+                "cat_label":     cat_label,
+                "filed":         filed,
+                "owner":         grantor.strip().title(),
+                "grantee":       grantee.strip().title(),
+                "amount":        None,
+                "legal":         legal[:200],
+                "clerk_url":     clerk_url,
+                "prop_address":  address,
+                "prop_city":     town.strip().title() or "Dallas",
+                "prop_state":    "TX",
+                "prop_zip":      "",
+                "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
+                "source":        "Dallas County Clerk",
+                "neighborhood":  "", "viol_status": "", "viol_desc": "",
+                "viol_severity": "",
+                "delinquent":    False, "delinq_amt": "",
+                "homestead":     None, "appraised":  "",
+                "out_of_state":  False,
+                "luc":           "", "luc_desc": "",
+                "score":         0,  "flags":    [],
+            }
+        except Exception as e:
+            log.debug("PublicSearch row parse error: %s", e)
+            return None
 
     def _fetch_doc(self, session, doc_id: str, cat: str, cat_label: str) -> Optional[dict]:
         try:
