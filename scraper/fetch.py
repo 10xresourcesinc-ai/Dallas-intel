@@ -460,11 +460,11 @@ class DallasTaxSaleScraper:
 
     # Exact parameters from browser Network tab — Dallas metro bounding box
     API_URL  = "https://taxsales.lgbs.com/map"
-    LAT      = 32.81874118033135
-    LON      = -96.732096
+    LAT      = 32.82286488974121
+    LON      = -96.78034507472077
     ZOOM     = 10
     PAGE     = 50
-    IN_BBOX  = "-97.40638188867187,32.46198950912711,-96.05781011132812,33.174066019764034"
+    IN_BBOX  = "-97.38939964015046,32.49972450731482,-96.17129050929108,33.144834006237964"
 
     # Dallas-area county names to filter for (site covers all of Texas)
     DALLAS_COUNTIES = {"dallas", "collin", "denton", "tarrant", "rockwall",
@@ -491,6 +491,8 @@ class DallasTaxSaleScraper:
                     "zoom":      self.ZOOM,
                     "offset":    offset,
                     "ordering":  "precinct,sale_nbr,uid",
+                    "county":    "DALLAS COUNTY",
+                    "state":     "TX",
                     "sale_type": "SALE,RESALE,STRUCK OFF,FUTURE SALE",
                     "limit":     self.PAGE,
                     "in_bbox":   self.IN_BBOX,
