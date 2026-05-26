@@ -321,15 +321,13 @@ class DallasPublicSearchScraper:
                     params = {
                         "department":        "RP",
                         "keywordSearch":     "false",
-                        "limit":             250,
-                        "offset":            offset,
                         "recordedDateRange": date_range,
                         "searchOcrText":     "false",
                         "searchType":        "quickSearch",
                         "searchValue":       search_val,
-                        "sort":              "asc",
-                        "sortBy":            "recordedDate",
                     }
+                    if offset > 0:
+                        params["offset"] = offset
                     r = session.get(self.SEARCH_URL, params=params, timeout=30)
                     if r.status_code != 200:
                         log.warning("PublicSearch %s HTTP %d", search_val, r.status_code)
@@ -338,7 +336,10 @@ class DallasPublicSearchScraper:
                     links = soup.select("a[href*='/doc/']")
                     ids   = list({a["href"].split("/doc/")[1].split("?")[0]
                                   for a in links if "/doc/" in a["href"]})
-                    log.info("PublicSearch '%s' offset %d: %d doc IDs", search_val, offset, len(ids))
+                    log.info("PublicSearch '%s' offset %d: %d doc IDs (page len %d)",
+                             search_val, offset, len(ids), len(r.text))
+                    if len(ids) == 0 and len(r.text) < 5000:
+                        log.warning("PublicSearch short response: %s", r.text[:500])
                     for doc_id in ids:
                         if doc_id not in all_ids:
                             all_ids[doc_id] = (cat, cat_label)
