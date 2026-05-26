@@ -774,13 +774,14 @@ class BankruptcyScraper:
             "docket__date_filed__gte": cutoff,
             "order_by":                "-docket__date_filed",
             # FIX 3 — was 10; larger pages = fewer list requests before sub-fetches
-            "page_size":               50,
+            "page_size":               100,
             "format":                  "json",
             "fields":                  "docket,chapter,date_filed,debtor_name,docket_number",
         }
-        next_url = CL_BK_URL
-        page     = 1
-        fetched  = 0
+        next_url  = CL_BK_URL
+        page      = 1
+        fetched   = 0
+        MAX_PAGES = 50  # cap to prevent timeout
 
         while next_url:
             try:
@@ -823,6 +824,7 @@ class BankruptcyScraper:
                 if not next_link:
                     break
 
+                time.sleep(0.3)
                 # CourtListener blocks past page 100 — date-chunk workaround
                 if page >= 99:
                     dates = [r.get("date_filed", "") for r in results if r.get("date_filed")]
@@ -842,8 +844,11 @@ class BankruptcyScraper:
                 else:
                     next_url = next_link
                     page    += 1
+                    if page > MAX_PAGES:
+                        log.info("BK Ch.%s hit MAX_PAGES %d — stopping", chapter, MAX_PAGES)
+                        break
 
-                time.sleep(1)
+                time.sleep(0.3)
             except Exception as e:
                 log.warning("BK Ch.%s page %d error: %s", chapter, page, e)
                 break
