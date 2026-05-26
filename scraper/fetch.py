@@ -360,6 +360,67 @@ class DallasPublicSearchScraper:
         log.info("PublicSearch: %d records parsed from table", len(records))
         return records
 
+    def _parse_api_item(self, item: dict, cat: str, cat_label: str) -> Optional[dict]:
+        """Parse a JSON item from the PublicSearch API."""
+        try:
+            doc_id   = str(item.get("id") or item.get("docId") or item.get("documentId") or "")
+            doc_num  = str(item.get("documentNumber") or item.get("doc_number") or item.get("docNumber") or doc_id)
+            doc_type = (item.get("documentType") or item.get("docType") or cat).strip()
+            recorded = (item.get("recordedDate") or item.get("recorded_date") or "").strip()
+            grantor  = (item.get("grantor") or item.get("grantorName") or "").strip()
+            grantee  = (item.get("grantee") or item.get("granteeName") or "").strip()
+            legal    = (item.get("legalDescription") or item.get("legal") or "").strip()
+            town     = (item.get("city") or item.get("town") or "Dallas").strip()
+
+            filed = ""
+            try:
+                filed = datetime.strptime(recorded[:10], "%Y-%m-%d").strftime("%m/%d/%Y")
+            except Exception:
+                try:
+                    filed = datetime.strptime(recorded[:10], "%m/%d/%Y").strftime("%m/%d/%Y")
+                except Exception:
+                    filed = recorded[:10]
+
+            address = ""
+            m = re.search(r"(\d+\s+\S+(?:\s+\S+){1,5}(?:ST|AVE|BLVD|DR|RD|LN|CT|WAY|PL|TRL|PKWY))",
+                          legal, re.I)
+            if m:
+                address = m.group(1).strip().title()
+
+            clerk_url = f"https://dallas.tx.publicsearch.us/doc/{doc_id}" if doc_id else ""
+
+            if not grantor and not doc_num:
+                return None
+
+            return {
+                "doc_num":       doc_num,
+                "doc_type":      doc_type,
+                "cat":           cat,
+                "cat_label":     cat_label,
+                "filed":         filed,
+                "owner":         grantor.title(),
+                "grantee":       grantee.title(),
+                "amount":        None,
+                "legal":         legal[:200],
+                "clerk_url":     clerk_url,
+                "prop_address":  address,
+                "prop_city":     town.title() or "Dallas",
+                "prop_state":    "TX",
+                "prop_zip":      "",
+                "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
+                "source":        "Dallas County Clerk",
+                "neighborhood":  "", "viol_status": "", "viol_desc": "",
+                "viol_severity": "",
+                "delinquent":    False, "delinq_amt": "",
+                "homestead":     None, "appraised":  "",
+                "out_of_state":  False,
+                "luc":           "", "luc_desc": "",
+                "score":         0,  "flags":    [],
+            }
+        except Exception as e:
+            log.debug("PublicSearch API item parse error: %s", e)
+            return None
+
     def _parse_row(self, row, cat: str, cat_label: str) -> Optional[dict]:
         """Parse a table row directly — all data is in col-0 through col-10."""
         try:
@@ -540,16 +601,11 @@ class DallasTaxSaleScraper:
         while True:
             try:
                 params = {
-                    "lat":       self.LAT,
-                    "lon":       self.LON,
-                    "zoom":      self.ZOOM,
+                    "in_bbox":   self.IN_BBOX,
                     "offset":    offset,
                     "ordering":  "precinct,sale_nbr,uid",
-                    "county":    "DALLAS COUNTY",
-                    "state":     "TX",
                     "sale_type": "SALE,RESALE,STRUCK OFF,FUTURE SALE",
                     "limit":     self.PAGE,
-                    "in_bbox":   self.IN_BBOX,
                 }
                 r = session.get(self.API_URL, params=params, timeout=30)
                 if r.status_code != 200:
