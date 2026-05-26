@@ -634,7 +634,9 @@ class DallasTaxSaleScraper:
                 for item in items:
                     # Filter to Dallas metro only
                     county = (item.get("county") or "").lower().strip()
-                    if county and county not in self.DALLAS_COUNTIES:
+                    # LGBS returns "dallas county" or "dallas" — check if any of our
+                    # target county names appear anywhere in the county field
+                    if county and not any(c in county for c in self.DALLAS_COUNTIES):
                         continue
                     rec = self._to_record(item)
                     if rec:
