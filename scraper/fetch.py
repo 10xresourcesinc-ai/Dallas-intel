@@ -898,18 +898,18 @@ class BankruptcyScraper:
         while next_url:
             try:
                 resp = None
-                for attempt in range(3):
+                for attempt in range(2):
                     try:
                         resp = session.get(
                             next_url,
                             params=params if page == 1 else None,
-                            timeout=60,
+                            timeout=15,
                         )
                         break
                     except Exception as te:
                         log.warning("BK Ch.%s page %d attempt %d timeout: %s",
                                     chapter, page, attempt + 1, te)
-                        time.sleep(10)
+                        time.sleep(3)
                 if resp is None:
                     log.warning("BK Ch.%s page %d — all retries failed, stopping", chapter, page)
                     break
