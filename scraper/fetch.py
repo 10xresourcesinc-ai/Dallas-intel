@@ -34,6 +34,9 @@ import logging
 import os
 import re
 import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -278,125 +281,174 @@ class DallasCodeScraper:
 
 
 # ===========================================================================
-# Source: NOFC — Trustee Sale / Foreclosure Notices
-# NOTE: dallas.tx.publicsearch.us blocks GitHub Actions IPs.
-# To fix: use a self-hosted runner or a residential proxy.
+# Source: NOFC + LP — Dallas County Clerk PublicSearch
+# Uses quickSearch API matching the browser URL.
+# Also pulls Lis Pendens (replaces manual PDF upload).
+# Self-hosted runner required — site blocks GitHub Actions IPs.
 # ===========================================================================
 
-class DallasNOFCScraper:
-    SEARCH_URL = f"{DALLAS_PUBLICSEARCH}/results"
-    DOC_TYPES  = ["TSN", "NOFC", "TS", "TRUSTSALE", "FORECLOSURE"]
+class DallasPublicSearchScraper:
+    BASE       = "https://dallas.tx.publicsearch.us"
+    SEARCH_URL = "https://dallas.tx.publicsearch.us/results"
+    DOC_URL    = "https://dallas.tx.publicsearch.us/doc/{}"
+
+    SEARCHES = [
+        ("trustee sale", "NOFC", "Notice of Foreclosure"),
+        ("foreclosure",  "NOFC", "Notice of Foreclosure"),
+        ("lis pendens",  "LP",   "Lis Pendens"),
+    ]
+
+    def _make_session(self):
+        s = make_session()
+        s.headers.update({
+            "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer":         "https://dallas.tx.publicsearch.us/",
+        })
+        return s
 
     def fetch(self) -> list:
-        log.info("Scraping Dallas foreclosure/trustee sale notices…")
-        session = make_session()
-        records = []
-        cutoff  = LOOKBACK_DATE.date()
+        log.info("Scraping Dallas County PublicSearch (NOFC + LP)...")
+        session    = self._make_session()
+        cutoff     = LOOKBACK_DATE.date()
+        date_range = f"{cutoff.strftime('%Y%m%d')},{date.today().strftime('%Y%m%d')}"
+        all_ids    = {}
 
-        for doc_type in self.DOC_TYPES:
-            try:
-                params = {
-                    "documentType": doc_type,
-                    "dateFrom":     cutoff.strftime("%m/%d/%Y"),
-                    "dateTo":       date.today().strftime("%m/%d/%Y"),
-                    "county":       "dallas",
-                    "state":        "TX",
-                }
-                r = session.get(self.SEARCH_URL, params=params, timeout=30)
-                if r.status_code != 200:
-                    log.debug("NOFC %s HTTP %d", doc_type, r.status_code)
-                    continue
-                soup = BeautifulSoup(r.text, "lxml")
-                rows = soup.select("table.results-table tr, div.result-row, tr[data-id]")
-                log.info("NOFC %s -> %d rows", doc_type, len(rows))
-                for row in rows:
-                    rec = self._parse_row(row, doc_type)
+        for search_val, cat, cat_label in self.SEARCHES:
+            offset = 0
+            while True:
+                try:
+                    params = {
+                        "department":        "RP",
+                        "keywordSearch":     "false",
+                        "limit":             250,
+                        "offset":            offset,
+                        "recordedDateRange": date_range,
+                        "searchOcrText":     "false",
+                        "searchType":        "quickSearch",
+                        "searchValue":       search_val,
+                        "sort":              "asc",
+                        "sortBy":            "recordedDate",
+                    }
+                    r = session.get(self.SEARCH_URL, params=params, timeout=30)
+                    if r.status_code != 200:
+                        log.warning("PublicSearch %s HTTP %d", search_val, r.status_code)
+                        break
+                    soup  = BeautifulSoup(r.text, "lxml")
+                    links = soup.select("a[href*='/doc/']")
+                    ids   = list({a["href"].split("/doc/")[1].split("?")[0]
+                                  for a in links if "/doc/" in a["href"]})
+                    log.info("PublicSearch '%s' offset %d: %d doc IDs", search_val, offset, len(ids))
+                    for doc_id in ids:
+                        if doc_id not in all_ids:
+                            all_ids[doc_id] = (cat, cat_label)
+                    if len(ids) < 250:
+                        break
+                    offset += 250
+                    time.sleep(0.5)
+                except Exception as e:
+                    log.warning("PublicSearch '%s' error: %s", search_val, e)
+                    break
+
+        log.info("PublicSearch: %d unique doc IDs to fetch", len(all_ids))
+        if not all_ids:
+            return []
+
+        records = []
+        def fetch_doc(args):
+            doc_id, (cat, cat_label) = args
+            return self._fetch_doc(session, doc_id, cat, cat_label)
+
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futs = {ex.submit(fetch_doc, item): item[0] for item in all_ids.items()}
+            for fut in as_completed(futs):
+                try:
+                    rec = fut.result()
                     if rec:
                         records.append(rec)
-                time.sleep(0.5)
-            except Exception as e:
-                log.warning("NOFC %s error: %s", doc_type, e)
+                except Exception as e:
+                    log.debug("PublicSearch doc fetch error: %s", e)
 
-        seen   = set()
-        deduped = []
-        for r in records:
-            key = r["doc_num"]
-            if key not in seen:
-                seen.add(key)
-                deduped.append(r)
+        log.info("PublicSearch: %d records fetched", len(records))
+        return records
 
-        log.info("NOFC: %d records (deduped)", len(deduped))
-        return deduped
-
-    def _parse_row(self, row, doc_type: str) -> Optional[dict]:
+    def _fetch_doc(self, session, doc_id: str, cat: str, cat_label: str) -> Optional[dict]:
         try:
-            cells = row.find_all(["td", "div"])
-            if len(cells) < 3:
+            url = self.DOC_URL.format(doc_id)
+            r   = session.get(url, timeout=20)
+            if r.status_code != 200:
                 return None
-            texts   = [c.get_text(strip=True) for c in cells]
-            doc_num = texts[0] if texts else ""
-            filed   = texts[1] if len(texts) > 1 else ""
-            grantor = texts[2] if len(texts) > 2 else ""
-            grantee = texts[3] if len(texts) > 3 else ""
-            amount  = None
-            for t in texts:
-                m = re.search(r"\$([\d,]+)", t)
-                if m:
+            soup = BeautifulSoup(r.text, "lxml")
+
+            def get_field(label):
+                for el in soup.find_all(string=re.compile(label, re.I)):
+                    parent = el.find_parent()
+                    if parent:
+                        nxt = parent.find_next_sibling()
+                        if nxt:
+                            return nxt.get_text(strip=True)
+                return ""
+
+            doc_num  = get_field("Document Number") or doc_id
+            doc_type = get_field("Document Type") or cat
+            recorded = get_field("Recorded Date") or ""
+            grantor  = get_field("GRANTOR") or get_field("Grantor") or ""
+            grantee  = get_field("GRANTEE") or get_field("Grantee") or ""
+            legal    = get_field("Legal Description") or ""
+            consider = get_field("Consideration") or ""
+
+            filed = ""
+            try:
+                filed = datetime.strptime(recorded.strip()[:10], "%m/%d/%Y").strftime("%m/%d/%Y")
+            except Exception:
+                filed = recorded[:10] if recorded else ""
+
+            address = ""
+            m = re.search(r"(\d+\s+\S+(?:\s+\S+){1,5}(?:ST|AVE|BLVD|DR|RD|LN|CT|WAY|PL|TRL|PKWY))\b",
+                          legal, re.I)
+            if m:
+                address = m.group(1).strip().title()
+
+            amount = None
+            if consider:
+                m2 = re.search(r"[\d,]+", consider.replace("$", ""))
+                if m2:
                     try:
-                        amount = float(m.group(1).replace(",", ""))
+                        amount = float(m2.group().replace(",", ""))
                     except Exception:
                         pass
-                    break
-            address = ""
-            for t in texts:
-                if re.search(r"\d+\s+\w+\s+(st|ave|blvd|dr|rd|ln|ct|way|pl)\b", t, re.I):
-                    address = t.strip().title()
-                    break
-            link = ""
-            a = row.find("a", href=True)
-            if a:
-                link = DALLAS_PUBLICSEARCH + a["href"] if a["href"].startswith("/") else a["href"]
 
-            if not doc_num and not grantor:
+            if not grantor and not doc_num:
                 return None
 
             return {
                 "doc_num":       doc_num,
                 "doc_type":      doc_type,
-                "cat":           "NOFC",
-                "cat_label":     "Notice of Foreclosure",
+                "cat":           cat,
+                "cat_label":     cat_label,
                 "filed":         filed,
-                "owner":         grantor.title(),
-                "grantee":       grantee.title(),
+                "owner":         grantor.strip().title(),
+                "grantee":       grantee.strip().title(),
                 "amount":        amount,
-                "legal":         "",
-                "clerk_url":     link,
+                "legal":         legal[:200],
+                "clerk_url":     url,
                 "prop_address":  address,
                 "prop_city":     "Dallas",
                 "prop_state":    "TX",
                 "prop_zip":      "",
                 "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
-                "source":        "Court Docket",
+                "source":        "Dallas County Clerk",
                 "neighborhood":  "", "viol_status": "", "viol_desc": "",
                 "viol_severity": "",
                 "delinquent":    False, "delinq_amt": "",
-                "homestead":     None,
-                "appraised":     "",
+                "homestead":     None, "appraised":  "",
                 "out_of_state":  False,
                 "luc":           "", "luc_desc": "",
-                "score":         0,
-                "flags":         [],
+                "score":         0,  "flags":    [],
             }
         except Exception as e:
-            log.debug("NOFC row parse error: %s", e)
+            log.debug("PublicSearch doc %s error: %s", doc_id, e)
             return None
-
-
-# ===========================================================================
-# Source: TAXSALE — Delinquent Tax Sale List (LGBS)
-# NOTE: taxsales.lgbs.com blocks GitHub Actions IPs.
-# To fix: use a self-hosted runner or a residential proxy.
-# ===========================================================================
 
 class DallasTaxSaleScraper:
     """
@@ -426,6 +478,7 @@ class DallasTaxSaleScraper:
             "Accept":          "application/json, text/plain, */*",
             "Referer":         "https://taxsales.lgbs.com/",
             "Origin":          "https://taxsales.lgbs.com",
+            "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         })
         records = []
         offset  = 0
@@ -451,7 +504,7 @@ class DallasTaxSaleScraper:
                 try:
                     data = r.json()
                 except Exception:
-                    log.warning("LGBS API returned non-JSON — site may be blocking")
+                    log.warning("LGBS API returned non-JSON - site may be blocking")
                     break
 
                 # Handle both {"results": [...]} and bare list responses
@@ -1170,7 +1223,7 @@ def main():
     log.info("Total after code violations: %d", len(all_records))
 
     # 2. Foreclosure / trustee sale notices
-    all_records.extend(DallasNOFCScraper().fetch())
+    all_records.extend(DallasPublicSearchScraper().fetch())
     log.info("Total after NOFC: %d", len(all_records))
 
     # 3. Tax sale list
