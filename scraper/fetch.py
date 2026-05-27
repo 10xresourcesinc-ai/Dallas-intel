@@ -658,13 +658,21 @@ class DallasTaxSaleScraper:
         try:
             address_full = (item.get("address_full") or
                             item.get("address") or "").strip().title()
-            street       = (item.get("street_name") or "").strip().title()
-            city         = (item.get("city") or
+            street       = (item.get("street_name") or
+                            item.get("prop_address_one") or "").strip().title()
+            city         = (item.get("prop_city") or item.get("city") or
                             item.get("municipality") or "Dallas").strip().title()
-            state        = (item.get("state") or "TX").strip().upper()
-            zipcode      = str(item.get("zip") or item.get("zip_code") or "").strip()
-            cause_num    = str(item.get("cause_number") or
+            state        = (item.get("prop_state") or item.get("state") or "TX").strip().upper()
+            zipcode      = str(item.get("prop_zipcode") or item.get("zip") or
+                               item.get("zip_code") or "").strip()
+            cause_num    = str(item.get("cause_nbr") or item.get("cause_number") or
                                item.get("uid") or "").strip()
+
+            # Coordinates from LGBS geometry — used for precise DCAD spatial lookup
+            geo      = item.get("geometry") or {}
+            coords   = geo.get("coordinates") or []
+            prop_lng = float(coords[0]) if len(coords) >= 2 else None
+            prop_lat = float(coords[1]) if len(coords) >= 2 else None
             sale_date    = (item.get("sale_date") or "").strip()
             sale_type    = (item.get("sale_type") or "SALE").strip()
             adj_value    = item.get("adjudged_value") or item.get("adjudged_val")
@@ -722,6 +730,8 @@ class DallasTaxSaleScraper:
                 "prop_city":     city,
                 "prop_state":    state,
                 "prop_zip":      zipcode,
+                "prop_lng":      prop_lng,
+                "prop_lat":      prop_lat,
                 "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
                 "source":        "Tax Sale List",
                 "neighborhood":  precinct,
@@ -1098,9 +1108,11 @@ class ParcelLookup:
         for rec in records:
             address = rec.get("prop_address", "")
             parcel  = rec.get("legal", "")
-            if not address and not parcel:
+            lat     = rec.get("prop_lat")
+            lng     = rec.get("prop_lng")
+            if not address and not parcel and not lat:
                 continue
-            match = self._lookup(address, parcel)
+            match = self._lookup(address, parcel, lat, lng)
             if match:
                 self._apply(rec, match)
                 enriched += 1
@@ -1108,7 +1120,39 @@ class ParcelLookup:
         log.info("Parcel enrichment: %d/%d records matched", enriched, len(records))
         return records
 
-    def _lookup(self, address: str, parcel: str) -> Optional[dict]:
+    def _lookup(self, address: str, parcel: str,
+                lat: float = None, lng: float = None) -> Optional[dict]:
+
+        OUT_FIELDS = (
+            "ACCOUNT_NUM,OWNER_NAME,SITUS_NUM,SITUS_STREET,SITUS_CITY,"
+            "SITUS_ZIP,MAIL_ADDR1,MAIL_CITY,MAIL_STATE,MAIL_ZIP,"
+            "HOMESTEAD_EXEMPT,APPRAISED_VALUE,LUC,LUC_DESC"
+        )
+
+        # --- 1. Spatial lookup (most precise — uses GPS coordinates from LGBS) ---
+        if lat is not None and lng is not None:
+            try:
+                params = {
+                    "geometry":      f"{lng},{lat}",
+                    "geometryType":  "esriGeometryPoint",
+                    "inSR":          "4326",
+                    "spatialRel":    "esriSpatialRelIntersects",
+                    "outFields":     OUT_FIELDS,
+                    "f":             "json",
+                    "resultRecordCount": 1,
+                    "returnGeometry": "false",
+                }
+                r = self._session.get(DCAD_URL, params=params, timeout=15)
+                if r.status_code == 200:
+                    features = r.json().get("features") or []
+                    if features:
+                        attrs = features[0].get("attributes", {})
+                        log.debug("DCAD spatial hit: %s", dict(list(attrs.items())[:6]))
+                        return attrs
+            except Exception as e:
+                log.debug("DCAD spatial lookup error: %s", e)
+
+        # --- 2. Attribute queries (fallback when no coordinates) ---
         queries = []
 
         if parcel:
@@ -1119,15 +1163,9 @@ class ParcelLookup:
             num_match = re.match(r"^(\d+)\s+(.+?)(?:,|$)", address)
             if num_match:
                 num    = num_match.group(1)
-                # FIX 1 — normalize street to DCAD's uppercase + abbreviated suffix format.
-                # Previously this was .upper()[:20] which cut names mid-word, and
-                # didn't convert e.g. "BOULEVARD" → "BLVD", causing 0 matches.
                 street = _normalize_street_for_dcad(num_match.group(2).strip().split(",")[0])
                 queries.append(f"SITUS_NUM='{num}' AND SITUS_STREET LIKE '%{street}%'")
             else:
-                # No house number (e.g. LGBS returns "Kenneth Hopper Dr, Dallas").
-                # Strip city suffix and query by street name only so DCAD can
-                # at least return the address with the correct SITUS_NUM.
                 street_raw = address.split(",")[0].strip()
                 if street_raw:
                     street = _normalize_street_for_dcad(street_raw)
@@ -1137,11 +1175,7 @@ class ParcelLookup:
             try:
                 params = {
                     "where":             where,
-                    "outFields":         (
-                        "ACCOUNT_NUM,OWNER_NAME,SITUS_NUM,SITUS_STREET,SITUS_CITY,"
-                        "SITUS_ZIP,MAIL_ADDR1,MAIL_CITY,MAIL_STATE,MAIL_ZIP,"
-                        "HOMESTEAD_EXEMPT,APPRAISED_VALUE,LUC,LUC_DESC"
-                    ),
+                    "outFields":         OUT_FIELDS,
                     "f":                 "json",
                     "resultRecordCount": 1,
                     "returnGeometry":    "false",
@@ -1154,7 +1188,7 @@ class ParcelLookup:
                 if not features:
                     continue
                 attrs = features[0].get("attributes", {})
-                log.debug("DCAD attrs sample: %s", dict(list(attrs.items())[:10]))
+                log.debug("DCAD attr hit: %s", dict(list(attrs.items())[:6]))
                 return attrs
             except Exception as e:
                 log.debug("DCAD lookup error: %s", e)
