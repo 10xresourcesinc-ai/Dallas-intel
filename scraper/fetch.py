@@ -1156,13 +1156,17 @@ class ParcelLookup:
     def _apply(self, rec: dict, attrs: dict):
         situs_num    = str(attrs.get("SITUS_NUM") or "").strip()
         situs_street = (attrs.get("SITUS_STREET") or "").strip().title()
-      if situs_num and situs_street:
-    rec["prop_address"] = f"{situs_num} {situs_street}"
-    rec["prop_city"]    = (attrs.get("SITUS_CITY") or "Dallas").strip().title()
-    rec["prop_zip"]     = str(attrs.get("SITUS_ZIP") or "").strip()
-elif situs_street and not rec.get("prop_address"):
-    # DCAD has street but no number — keep existing address if we have one
-    rec["prop_address"] = situs_street
+        if situs_num and situs_street:
+            # Always prefer DCAD's full address (number + street) over partial
+            # addresses from source data (e.g. LGBS only returns street name).
+            rec["prop_address"] = f"{situs_num} {situs_street}"
+            rec["prop_city"]    = (attrs.get("SITUS_CITY") or "Dallas").strip().title()
+            rec["prop_zip"]     = str(attrs.get("SITUS_ZIP") or "").strip()
+        elif situs_street and not rec.get("prop_address"):
+            # DCAD has street but no number — only fill if record has nothing yet
+            rec["prop_address"] = situs_street
+            rec["prop_city"]    = (attrs.get("SITUS_CITY") or "Dallas").strip().title()
+            rec["prop_zip"]     = str(attrs.get("SITUS_ZIP") or "").strip()
 
         if not rec.get("owner"):
             rec["owner"] = (attrs.get("OWNER_NAME") or "").strip().title()
