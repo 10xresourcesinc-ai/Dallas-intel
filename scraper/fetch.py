@@ -701,7 +701,7 @@ class DallasTaxSaleScraper:
                 except Exception:
                     appraised = str(adj_value)
 
-            if not address_full and not cause_num:
+            if not address_full and not street and not cause_num:
                 return None
 
             clerk_url = (f"https://taxsales.lgbs.com/?cause={cause_num}"
@@ -718,7 +718,7 @@ class DallasTaxSaleScraper:
                 "amount":        amount,
                 "legal":         geo_id,
                 "clerk_url":     clerk_url,
-                "prop_address":  address_full or street,
+                "prop_address":  address_full or (f"{street}, {city}" if street else ""),
                 "prop_city":     city,
                 "prop_state":    state,
                 "prop_zip":      zipcode,
@@ -1124,6 +1124,14 @@ class ParcelLookup:
                 # didn't convert e.g. "BOULEVARD" → "BLVD", causing 0 matches.
                 street = _normalize_street_for_dcad(num_match.group(2).strip().split(",")[0])
                 queries.append(f"SITUS_NUM='{num}' AND SITUS_STREET LIKE '%{street}%'")
+            else:
+                # No house number (e.g. LGBS returns "Kenneth Hopper Dr, Dallas").
+                # Strip city suffix and query by street name only so DCAD can
+                # at least return the address with the correct SITUS_NUM.
+                street_raw = address.split(",")[0].strip()
+                if street_raw:
+                    street = _normalize_street_for_dcad(street_raw)
+                    queries.append(f"SITUS_STREET LIKE '%{street}%'")
 
         for where in queries:
             try:
