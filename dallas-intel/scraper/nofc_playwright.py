@@ -1,6 +1,5 @@
 ﻿import asyncio, hashlib, logging, re
 from datetime import datetime
-from typing import Optional
 
 log = logging.getLogger("dallas-intel")
 
@@ -35,17 +34,31 @@ async def _get_rows(page):
     }""")
 
 async def _fetch_page(playwright, offset, retries=3):
+    # Linux CI requires these flags for headless Chromium
+    browser_args = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+    ]
     for attempt in range(retries):
-        browser = await playwright.chromium.launch(headless=True)
+        browser = await playwright.chromium.launch(headless=True, args=browser_args)
         try:
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            )
             page = await context.new_page()
-            await page.goto("https://dallas.tx.publicsearch.us/", wait_until="networkidle", timeout=20000)
-            await asyncio.sleep(1)
-            await page.goto(f"{BASE_URL}&offset={offset}", wait_until="networkidle", timeout=45000)
-            for _ in range(20):
+            # Establish session via homepage first
+            await page.goto("https://dallas.tx.publicsearch.us/", wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(2)
+            # Navigate to results page
+            await page.goto(f"{BASE_URL}&offset={offset}", wait_until="networkidle", timeout=60000)
+            # Poll up to 30 seconds for rows to render
+            await asyncio.sleep(3)
+            for _ in range(27):
                 data = await _get_rows(page)
-                if data["rows"]: return data
+                if data["rows"]:
+                    return data
                 await asyncio.sleep(1)
             return await _get_rows(page)
         except Exception as e:
@@ -78,6 +91,7 @@ async def _scrape_all():
             batch = data["rows"]
             log.info("NOFC: page %d rows=%d", page_num, len(batch))
             if not batch:
+                log.warning("NOFC: empty page at offset=%d — stopping", offset)
                 break
             for r in batch:
                 address = _extract_address(r.get("legal_desc",""), r.get("city",""))
