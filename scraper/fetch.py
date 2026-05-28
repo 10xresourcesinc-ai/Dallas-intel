@@ -1240,6 +1240,76 @@ class ParcelLookup:
             rec["legal"] = acct
 
 
+
+# ===========================================================================
+# Nominatim reverse geocoder (free, no API key, covers all DFW)
+# ===========================================================================
+
+class NominatimGeocoder:
+    """
+    Reverse-geocodes records that have coordinates but no house number.
+    Uses OpenStreetMap Nominatim — free, no key, 1 req/sec limit.
+    Only called for TAXSALE records where DCAD returned no SITUS_NUM.
+    """
+
+    BASE_URL = "https://nominatim.openstreetmap.org/reverse"
+    HEADERS  = {"User-Agent": "DallasIntel/1.0 (github.com/10xresourcesinc-ai/Dallas-intel)"}
+
+    def _needs_geocode(self, rec: dict) -> bool:
+        if not rec.get("prop_lat") or not rec.get("prop_lng"):
+            return False
+        address = rec.get("prop_address", "")
+        return not re.match(r"^\d+\s", address)
+
+    def geocode(self, records: list) -> list:
+        targets = [r for r in records if self._needs_geocode(r)]
+        if not targets:
+            log.info("Nominatim: no records need geocoding")
+            return records
+
+        log.info("Nominatim: reverse-geocoding %d records (1 req/sec)...", len(targets))
+        fixed = 0
+        for rec in targets:
+            try:
+                params = {
+                    "lat":            rec["prop_lat"],
+                    "lon":            rec["prop_lng"],
+                    "format":         "jsonv2",
+                    "addressdetails": 1,
+                }
+                r = requests.get(
+                    self.BASE_URL, params=params,
+                    headers=self.HEADERS, timeout=10
+                )
+                if r.status_code != 200:
+                    time.sleep(1)
+                    continue
+
+                data    = r.json()
+                addr    = data.get("address", {})
+                house   = addr.get("house_number", "")
+                road    = addr.get("road", "")
+                city    = (addr.get("city") or addr.get("town") or
+                           addr.get("village") or addr.get("county") or "")
+                zipcode = addr.get("postcode", "")
+
+                if house and road:
+                    rec["prop_address"] = f"{house} {road.title()}"
+                    if city:
+                        rec["prop_city"] = city.title()
+                    if zipcode:
+                        rec["prop_zip"] = zipcode
+                    fixed += 1
+                    log.debug("Nominatim fixed: %s", rec["prop_address"])
+
+            except Exception as e:
+                log.debug("Nominatim error for %s: %s", rec.get("doc_num"), e)
+            finally:
+                time.sleep(1)
+
+        log.info("Nominatim: fixed %d/%d records", fixed, len(targets))
+        return records
+
 # ===========================================================================
 # Scoring
 # ===========================================================================
@@ -1410,6 +1480,12 @@ def main():
     lookup = ParcelLookup()
     lookup.load()
     all_records = lookup.enrich(all_records)
+
+    # 6b. Nominatim reverse geocoding — fills house numbers for TAXSALE records
+    #     that have GPS coords but no street number after DCAD enrichment.
+    #     Free, no API key, covers all DFW. Rate-limited to 1 req/sec.
+    geocoder = NominatimGeocoder()
+    all_records = geocoder.geocode(all_records)
 
     # 7. Score
     # FIX 6 — build owner→categories index once here so scoring is O(n) not O(n²)
