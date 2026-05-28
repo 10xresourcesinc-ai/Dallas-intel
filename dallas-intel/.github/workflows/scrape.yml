@@ -1,0 +1,57 @@
+﻿name: Daily Lead Scrape
+on:
+  schedule:
+    # 6:00 AM CT daily (11:00 UTC - adjusts for CDT/CST automatically)
+    - cron: "0 11 * * *"
+  workflow_dispatch:     # allow manual trigger from GitHub UI
+permissions:
+  contents: write        # needed to commit data/ and push gh-pages
+  pages: write
+  id-token: write
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r scraper/requirements.txt
+
+      - name: Install Playwright + Chromium (for NOFC scraper)
+        run: |
+          pip install playwright
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
+
+      - name: Run scraper
+        env:
+          SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+        run: python scraper/fetch.py
+
+      - name: Build dashboard
+        run: python dashboard/build_dashboard.py
+
+      - name: Commit data files
+        run: |
+          git config user.name  "dallas-intel-bot"
+          git config user.email "bot@10xresources.com"
+          git add data/
+          git diff --staged --quiet || git commit -m "data: scrape $(date -u +%Y-%m-%d)"
+          git push
+
+      - name: Deploy dashboard to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dashboard
+          publish_branch: gh-pages
+          force_orphan: false
+          commit_message: "dashboard: update $(date -u +%Y-%m-%d)"
