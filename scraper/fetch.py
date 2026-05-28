@@ -656,10 +656,12 @@ class DallasTaxSaleScraper:
 
     def _to_record(self, item: dict) -> Optional[dict]:
         try:
-            address_full = (item.get("address_full") or
+            # prop_address_one contains the FULL address e.g. "2811 S Story Rd"
+            # street_name is street-only fallback e.g. "S Story Rd"
+            address_full = (item.get("prop_address_one") or
+                            item.get("address_full") or
                             item.get("address") or "").strip().title()
-            street       = (item.get("street_name") or
-                            item.get("prop_address_one") or "").strip().title()
+            street       = (item.get("street_name") or "").strip().title()
             city         = (item.get("prop_city") or item.get("city") or
                             item.get("municipality") or "Dallas").strip().title()
             state        = (item.get("prop_state") or item.get("state") or "TX").strip().upper()
@@ -1480,12 +1482,6 @@ def main():
     lookup = ParcelLookup()
     lookup.load()
     all_records = lookup.enrich(all_records)
-
-    # 6b. Nominatim reverse geocoding — fills house numbers for TAXSALE records
-    #     that have GPS coords but no street number after DCAD enrichment.
-    #     Free, no API key, covers all DFW. Rate-limited to 1 req/sec.
-    geocoder = NominatimGeocoder()
-    all_records = geocoder.geocode(all_records)
 
     # 7. Score
     # FIX 6 — build owner→categories index once here so scoring is O(n) not O(n²)
