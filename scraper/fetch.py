@@ -308,57 +308,130 @@ class DallasPublicSearchScraper:
         return s
 
     def fetch(self) -> list:
-        log.info("Scraping Dallas County PublicSearch (NOFC + LP)...")
-        session    = self._make_session()
+        log.info("Scraping Dallas County PublicSearch via Playwright (NOFC + LP)...")
+        try:
+            import asyncio as _asyncio
+            from playwright.async_api import async_playwright as _apw
+        except ImportError:
+            log.error("Playwright not installed — run: pip install playwright && python -m playwright install chromium")
+            return []
+
         cutoff     = LOOKBACK_DATE.date()
-        date_range = f"{cutoff.strftime('%Y%m%d')},{date.today().strftime('%Y%m%d')}"
-        all_ids    = {}
+        start_str  = cutoff.strftime("%Y%m%d")
+        end_str    = date.today().strftime("%Y%m%d")
+        LIMIT      = 50
+        BARGS      = ["--no-sandbox", "--disable-setuid-sandbox",
+                      "--disable-dev-shm-usage", "--disable-gpu"]
 
-        for search_val, cat, cat_label in self.SEARCHES:
-            offset = 0
-            while True:
+        async def _get_rows(page):
+            return await page.evaluate("""() => {
+                const out = [];
+                for (const tr of document.querySelectorAll('tbody tr')) {
+                    const cb = tr.querySelector('input[id^="table-checkbox-"]');
+                    if (!cb) continue;
+                    const id = cb.id.replace('table-checkbox-', '');
+                    const c = i => { const e = tr.querySelector('.col-'+i+' span'); return e ? e.innerText.trim() : ''; };
+                    out.push({id, g3:c(3), g4:c(4), g5:c(5), g6:c(6), g7:c(7), g9:c(9), g10:c(10)});
+                }
+                const m = document.body.innerText.match(/([0-9][0-9,]+)\s+results/);
+                return {rows: out, total: m ? parseInt(m[1].replace(/,/g,'')) : 0};
+            }""")
+
+        async def _load_page(pw, url):
+            for attempt in range(3):
+                browser = await pw.chromium.launch(headless=True, args=BARGS)
                 try:
-                    params = {
-                        "department":        "RP",
-                        "keywordSearch":     "false",
-                        "recordedDateRange": date_range,
-                        "searchOcrText":     "false",
-                        "searchType":        "quickSearch",
-                        "searchValue":       search_val,
-                    }
-                    if offset > 0:
-                        params["offset"] = offset
-                    r = session.get(self.SEARCH_URL, params=params, timeout=30)
-                    if r.status_code != 200:
-                        log.warning("PublicSearch %s HTTP %d", search_val, r.status_code)
-                        break
-                    soup = BeautifulSoup(r.text, "lxml")
-                    rows = soup.select("tr[role='row']")
-                    log.info("PublicSearch '%s' offset %d: %d rows (page len %d)",
-                             search_val, offset, len(rows), len(r.text))
-
-                    for row in rows:
-                        rec = self._parse_row(row, cat, cat_label)
-                        if rec and rec["doc_num"] not in all_ids:
-                            all_ids[rec["doc_num"]] = rec
-
-                    ids = list(all_ids.keys())
-                    if len(rows) == 0:
-                        log.warning("PublicSearch no rows found. Snippet: %s", r.text[:300])
-                    for doc_id in ids:
-                        if doc_id not in all_ids:
-                            all_ids[doc_id] = (cat, cat_label)
-                    if len(ids) < 250:
-                        break
-                    offset += 250
-                    time.sleep(0.5)
+                    ctx  = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                    page = await ctx.new_page()
+                    await page.goto("https://dallas.tx.publicsearch.us/", wait_until="networkidle", timeout=30000)
+                    await _asyncio.sleep(2)
+                    await page.goto(url, wait_until="networkidle", timeout=60000)
+                    await _asyncio.sleep(3)
+                    for _ in range(27):
+                        data = await _get_rows(page)
+                        if data["rows"]: return data
+                        await _asyncio.sleep(1)
+                    return await _get_rows(page)
                 except Exception as e:
-                    log.warning("PublicSearch '%s' error: %s", search_val, e)
-                    break
+                    log.warning("PublicSearch load attempt %d: %s", attempt+1, e)
+                    await _asyncio.sleep(3)
+                finally:
+                    await browser.close()
+            return {"rows": [], "total": 0}
 
-        records = list(all_ids.values())
-        log.info("PublicSearch: %d records parsed from table", len(records))
-        return records
+        async def _scrape_one(pw, search_val, cat, cat_label):
+            base = (f"https://dallas.tx.publicsearch.us/results"
+                    f"?department=RP&searchType=quickSearch"
+                    f"&searchValue={search_val.replace(' ', '+')}"
+                    f"&recordedDateRange={start_str},{end_str}&limit={LIMIT}")
+            seen, recs = set(), []
+            total, offset, pnum = 9999, 0, 1
+            while offset < total:
+                data = await _load_page(pw, f"{base}&offset={offset}")
+                if pnum == 1:
+                    total = data["total"] or 9999
+                    log.info("PublicSearch '%s' total=%d", search_val, total)
+                batch = data["rows"]
+                log.info("PublicSearch '%s' page %d rows=%d", search_val, pnum, len(batch))
+                if not batch: break
+                for r in batch:
+                    key = r["g7"] or r["id"]
+                    if key in seen: continue
+                    seen.add(key)
+                    # parse date
+                    filed = ""
+                    try: filed = datetime.strptime(r["g6"].strip(), "%m/%d/%Y").strftime("%m/%d/%Y")
+                    except Exception: filed = r["g6"][:10] if r["g6"] else ""
+                    # extract address from legal desc
+                    address = ""
+                    m = re.search(r"(\d+\s+\S+(?:\s+\S+){1,5}(?:ST|AVE|BLVD|DR|RD|LN|CT|WAY|PL|TRL|PKWY))",
+                                  r["g10"], re.I)
+                    if m: address = m.group(1).strip().title()
+                    recs.append({
+                        "doc_num":      r["g7"] or r["id"],
+                        "doc_type":     r["g5"],
+                        "cat":          cat,
+                        "cat_label":    cat_label,
+                        "filed":        filed,
+                        "owner":        r["g3"].strip().title(),
+                        "grantee":      r["g4"].strip().title(),
+                        "amount":       None,
+                        "legal":        r["g10"][:200],
+                        "clerk_url":    f"https://dallas.tx.publicsearch.us/doc/{r['id']}",
+                        "prop_address": address,
+                        "prop_city":    r["g9"].strip().title() or "Dallas",
+                        "prop_state":   "TX",
+                        "prop_zip":     "",
+                        "mail_address": "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
+                        "source":       "Dallas County Clerk",
+                        "neighborhood": "", "viol_status": r["g5"], "viol_desc": r["g5"],
+                        "viol_severity": "high",
+                        "delinquent":   False, "delinq_amt": "",
+                        "homestead":    None,  "appraised":  "",
+                        "out_of_state": False,
+                        "luc":          "", "luc_desc": "",
+                        "score":        0,  "flags":    [],
+                    })
+                offset += LIMIT; pnum += 1
+                if offset < total: await _asyncio.sleep(2)
+            return recs
+
+        async def _run():
+            all_recs = []
+            async with _apw() as pw:
+                for sv, cat, label in self.SEARCHES:
+                    recs = await _scrape_one(pw, sv, cat, label)
+                    log.info("PublicSearch '%s': %d records", sv, len(recs))
+                    all_recs.extend(recs)
+            # dedup by doc_num
+            seen, out = set(), []
+            for r in all_recs:
+                if r["doc_num"] not in seen:
+                    seen.add(r["doc_num"]); out.append(r)
+            log.info("PublicSearch: %d records parsed from table", len(out))
+            return out
+
+        return _asyncio.run(_run())
 
     def _parse_api_item(self, item: dict, cat: str, cat_label: str) -> Optional[dict]:
         """Parse a JSON item from the PublicSearch API."""
