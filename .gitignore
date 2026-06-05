@@ -1,0 +1,26 @@
+﻿# Windows system files
+NTUSER.DAT*
+ntuser.dat*
+ntuser.ini
+*.blf
+*.regtrans-ms
+Sti_Trace.log
+.lesshst
+5}
+
+# Windows user folders
+AppData/
+Contacts/
+Downloads/
+Favorites/
+Links/
+Music/
+OneDrive/
+Pictures/
+Saved Games/
+Searches/
+Videos/
+
+# Other repos (not this one)
+cuyahoga-intel/
+dallas-intel/
