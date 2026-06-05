@@ -1,4 +1,4 @@
-name: Dallas Intel Lead Scraper
+﻿name: Dallas Intel Lead Scraper
 on:
   schedule:
     - cron: "0 8 * * *"
@@ -7,7 +7,7 @@ on:
       lookback_days:
         description: "Lookback window in days"
         required: false
-        default: "30"
+        default: "90"
 permissions:
   contents: write
   pages: write
@@ -67,3 +67,4 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
