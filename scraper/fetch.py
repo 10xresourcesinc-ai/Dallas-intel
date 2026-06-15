@@ -1,30 +1,30 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-Dallas Intel — Motivated Seller Lead Scraper
+Dallas Intel â€” Motivated Seller Lead Scraper
 =============================================
 Sources
-  NOFC     — Trustee sale / foreclosure notices  (Dallas County Clerk PublicSearch)
-  CODE     — Code violations                      (Dallas OpenData Socrata API)
-  TAXSALE  — Tax-delinquent sheriff sale list     (LGBS / dallascounty.org)
-  LP       — Lis pendens PDF upload               (drag-and-drop on dashboard)
-  BK       — Bankruptcy filings                   (CourtListener, Northern Dist TX)
+  NOFC     â€” Trustee sale / foreclosure notices  (Dallas County Clerk PublicSearch)
+  CODE     â€” Code violations                      (Dallas OpenData Socrata API)
+  TAXSALE  â€” Tax-delinquent sheriff sale list     (LGBS / dallascounty.org)
+  LP       â€” Lis pendens PDF upload               (drag-and-drop on dashboard)
+  BK       â€” Bankruptcy filings                   (CourtListener, Northern Dist TX)
 
 Parcel enrichment via DCAD ArcGIS MapServer
-Daily run via GitHub Actions → GitHub Pages dashboard
+Daily run via GitHub Actions â†’ GitHub Pages dashboard
 
 FIXES APPLIED
-  1. DCAD address mismatch  — streets now uppercased + common suffixes normalized
-                              (e.g. "Boulevard" → "BLVD") before querying DCAD.
+  1. DCAD address mismatch  â€” streets now uppercased + common suffixes normalized
+                              (e.g. "Boulevard" â†’ "BLVD") before querying DCAD.
                               Also removed the [:20] slice that cut street names mid-word.
-  2. BK infinite loop guard — date-chunking restart now stops if oldest date already
+  2. BK infinite loop guard â€” date-chunking restart now stops if oldest date already
                               reached the lookback cutoff, preventing an endless loop.
-  3. BK speed (2hr → ~25min)— page_size raised from 10 → 50; docket sub-fetches run
+  3. BK speed (2hr â†’ ~25min)â€” page_size raised from 10 â†’ 50; docket sub-fetches run
                               4 at a time with ThreadPoolExecutor instead of one-by-one.
-  4. CODE sort field typo   — violations dataset sort changed from "updated DESC"
+  4. CODE sort field typo   â€” violations dataset sort changed from "updated DESC"
                               (doesn't exist) to "created DESC" (the real field).
-  5. Scorer WEEK_AGO freeze — was computed once at import time; now computed fresh
+  5. Scorer WEEK_AGO freeze â€” was computed once at import time; now computed fresh
                               inside score() so it's always accurate.
-  6. Scorer O(n²) fix       — owner→categories index built once before scoring loop
+  6. Scorer O(nÂ²) fix       â€” ownerâ†’categories index built once before scoring loop
                               instead of scanning all records for every single record.
 """
 
@@ -119,7 +119,7 @@ def make_session() -> requests.Session:
     return s
 
 
-# FIX 1 — street suffix normalization for DCAD address matching.
+# FIX 1 â€” street suffix normalization for DCAD address matching.
 # DCAD stores streets like "ELM BLVD" but our addresses often say "Elm Boulevard".
 # This map converts the long form to the short form DCAD uses.
 _STREET_SUFFIX_MAP = {
@@ -139,13 +139,13 @@ def _normalize_street_for_dcad(street: str) -> str:
 
 
 # ===========================================================================
-# Source: Code Violations — Dallas OpenData Socrata
+# Source: Code Violations â€” Dallas OpenData Socrata
 # ===========================================================================
 
 class DallasCodeScraper:
     """
     Pulls code violations from Dallas OpenData Socrata API.
-    Dataset x9pz-kdq9 — updated daily, ~80k total records.
+    Dataset x9pz-kdq9 â€” updated daily, ~80k total records.
     """
 
     SEVERITY = {
@@ -157,7 +157,7 @@ class DallasCodeScraper:
     }
 
     def fetch(self) -> list:
-        log.info("Scraping Dallas code violations (Socrata)…")
+        log.info("Scraping Dallas code violations (Socrata)â€¦")
         session = make_session()
         records = []
 
@@ -173,7 +173,7 @@ class DallasCodeScraper:
             batch_total = 0
             while True:
                 try:
-                    # FIX 4 — violations dataset sort field was "updated DESC" which
+                    # FIX 4 â€” violations dataset sort field was "updated DESC" which
                     # doesn't exist; the real field is "created DESC".
                     params = {
                         "$limit":  limit,
@@ -184,7 +184,7 @@ class DallasCodeScraper:
                         params[where_key] = where_val
                     r = session.get(url, params=params, timeout=30)
                     if r.status_code != 200:
-                        log.warning("Socrata %s HTTP %d — %s",
+                        log.warning("Socrata %s HTTP %d â€” %s",
                                     label, r.status_code, r.text[:200])
                         break
                     batch = r.json()
@@ -281,10 +281,10 @@ class DallasCodeScraper:
 
 
 # ===========================================================================
-# Source: NOFC + LP — Dallas County Clerk PublicSearch
+# Source: NOFC + LP â€” Dallas County Clerk PublicSearch
 # Uses quickSearch API matching the browser URL.
 # Also pulls Lis Pendens (replaces manual PDF upload).
-# Self-hosted runner required — site blocks GitHub Actions IPs.
+# Self-hosted runner required â€” site blocks GitHub Actions IPs.
 # ===========================================================================
 
 class DallasPublicSearchScraper:
@@ -313,7 +313,7 @@ class DallasPublicSearchScraper:
             import asyncio as _asyncio
             from playwright.async_api import async_playwright as _apw
         except ImportError:
-            log.error("Playwright not installed — run: pip install playwright && python -m playwright install chromium")
+            log.error("Playwright not installed â€” run: pip install playwright && python -m playwright install chromium")
             return []
 
         cutoff     = LOOKBACK_DATE.date()
@@ -343,9 +343,9 @@ class DallasPublicSearchScraper:
                 try:
                     ctx  = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
                     page = await ctx.new_page()
-                    await page.goto("https://dallas.tx.publicsearch.us/", wait_until="networkidle", timeout=30000)
+                    await page.goto("https://dallas.tx.publicsearch.us/", wait_until="domcontentloaded", timeout=60000)
                     await _asyncio.sleep(2)
-                    await page.goto(url, wait_until="networkidle", timeout=60000)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=90000)
                     await _asyncio.sleep(3)
                     for _ in range(27):
                         data = await _get_rows(page)
@@ -495,7 +495,7 @@ class DallasPublicSearchScraper:
             return None
 
     def _parse_row(self, row, cat: str, cat_label: str) -> Optional[dict]:
-        """Parse a table row directly — all data is in col-0 through col-10."""
+        """Parse a table row directly â€” all data is in col-0 through col-10."""
         try:
             # Doc ID from checkbox id: "table-checkbox-314313835"
             chk = row.select_one("input[id^='table-checkbox-']")
@@ -645,11 +645,11 @@ class DallasTaxSaleScraper:
     """
     Pulls Dallas-area tax sale properties from the LGBS map API.
     The site is a JS app but loads property data from a /map endpoint
-    discovered via Network tab — returns JSON with full property details.
+    discovered via Network tab â€” returns JSON with full property details.
     Paginates using offset in steps of 50 until all records are fetched.
     """
 
-    # Real API endpoint discovered via Network tab — /api/property_sales/
+    # Real API endpoint discovered via Network tab â€” /api/property_sales/
     API_URL  = "https://taxsales.lgbs.com/api/property_sales/"
     PAGE     = 50
     IN_BBOX  = "-97.40638188867187,32.46198950912711,-96.05781011132812,33.174066019764034"
@@ -659,9 +659,9 @@ class DallasTaxSaleScraper:
                        "kaufman", "ellis", "johnson"}
 
     def fetch(self) -> list:
-        log.info("Scraping LGBS tax sale list via map API…")
+        log.info("Scraping LGBS tax sale list via map APIâ€¦")
         session = make_session()
-        # Mimic a real browser — the site checks headers
+        # Mimic a real browser â€” the site checks headers
         session.headers.update({
             "Accept":          "application/json, text/plain, */*",
             "Referer":         "https://taxsales.lgbs.com/",
@@ -682,7 +682,7 @@ class DallasTaxSaleScraper:
                 }
                 r = session.get(self.API_URL, params=params, timeout=30)
                 if r.status_code != 200:
-                    log.warning("LGBS API HTTP %d — %s", r.status_code, r.text[:200])
+                    log.warning("LGBS API HTTP %d â€” %s", r.status_code, r.text[:200])
                     break
 
                 # Response is JSON with a results array
@@ -707,7 +707,7 @@ class DallasTaxSaleScraper:
                 for item in items:
                     # Filter to Dallas metro only
                     county = (item.get("county") or "").lower().strip()
-                    # LGBS returns "dallas county" or "dallas" — check if any of our
+                    # LGBS returns "dallas county" or "dallas" â€” check if any of our
                     # target county names appear anywhere in the county field
                     if county and not any(c in county for c in self.DALLAS_COUNTIES):
                         continue
@@ -743,7 +743,7 @@ class DallasTaxSaleScraper:
             cause_num    = str(item.get("cause_nbr") or item.get("cause_number") or
                                item.get("uid") or "").strip()
 
-            # Coordinates from LGBS geometry — used for precise DCAD spatial lookup
+            # Coordinates from LGBS geometry â€” used for precise DCAD spatial lookup
             geo      = item.get("geometry") or {}
             coords   = geo.get("coordinates") or []
             prop_lng = float(coords[0]) if len(coords) >= 2 else None
@@ -811,7 +811,7 @@ class DallasTaxSaleScraper:
                 "source":        "Tax Sale List",
                 "neighborhood":  precinct,
                 "viol_status":   status,
-                "viol_desc":     f"Tax sale — {sale_type}",
+                "viol_desc":     f"Tax sale â€” {sale_type}",
                 "viol_severity": "high",
                 "delinquent":    True,
                 "delinq_amt":    f"{amount:,.2f}" if amount else "",
@@ -828,22 +828,22 @@ class DallasTaxSaleScraper:
 
 
 # ===========================================================================
-# Source: LP — Lis Pendens PDF (manual upload)
+# Source: LP â€” Lis Pendens PDF (manual upload)
 # Drop the PDF at data/lp_export.pdf before running.
 # ===========================================================================
 
 class LPScraper:
     def fetch(self) -> list:
         if not LP_PDF_PATH.exists():
-            log.info("No LP PDF found at %s — skipping", LP_PDF_PATH)
+            log.info("No LP PDF found at %s â€” skipping", LP_PDF_PATH)
             return []
         try:
             import pdfplumber as _pp
         except ImportError:
-            log.warning("pdfplumber not installed — LP PDF skipped. pip install pdfplumber")
+            log.warning("pdfplumber not installed â€” LP PDF skipped. pip install pdfplumber")
             return []
 
-        log.info("Found LP PDF at %s — parsing…", LP_PDF_PATH)
+        log.info("Found LP PDF at %s â€” parsingâ€¦", LP_PDF_PATH)
         records = []
         try:
             with _pp.open(str(LP_PDF_PATH)) as pdf:
@@ -932,7 +932,7 @@ class LPScraper:
 
 
 # ===========================================================================
-# Source: BK — Bankruptcy (CourtListener, Northern District TX)
+# Source: BK â€” Bankruptcy (CourtListener, Northern District TX)
 # ===========================================================================
 
 class BankruptcyScraper:
@@ -946,9 +946,9 @@ class BankruptcyScraper:
 
     def fetch(self) -> list:
         if not COURTLISTENER_TOKEN:
-            log.info("No COURTLISTENER_TOKEN — skipping BK")
+            log.info("No COURTLISTENER_TOKEN â€” skipping BK")
             return []
-        log.info("Scraping Northern District Texas bankruptcy filings…")
+        log.info("Scraping Northern District Texas bankruptcy filingsâ€¦")
         session = make_session()
         session.headers.update({
             "Authorization": f"Token {COURTLISTENER_TOKEN}",
@@ -970,7 +970,7 @@ class BankruptcyScraper:
             "chapter":                 chapter,
             "docket__date_filed__gte": cutoff,
             "order_by":                "-docket__date_filed",
-            # FIX 3 — was 10; larger pages = fewer list requests before sub-fetches
+            # FIX 3 â€” was 10; larger pages = fewer list requests before sub-fetches
             "page_size":               100,
             "format":                  "json",
             "fields":                  "docket,chapter,date_filed,debtor_name,docket_number",
@@ -996,10 +996,10 @@ class BankruptcyScraper:
                                     chapter, page, attempt + 1, te)
                         time.sleep(3)
                 if resp is None:
-                    log.warning("BK Ch.%s page %d — all retries failed, stopping", chapter, page)
+                    log.warning("BK Ch.%s page %d â€” all retries failed, stopping", chapter, page)
                     break
                 if resp.status_code == 429:
-                    log.warning("CourtListener rate limited — stopping BK")
+                    log.warning("CourtListener rate limited â€” stopping BK")
                     break
                 if resp.status_code != 200:
                     log.warning("BK Ch.%s HTTP %d: %s", chapter, resp.status_code, resp.text[:200])
@@ -1011,7 +1011,7 @@ class BankruptcyScraper:
                     break
                 log.info("BK chapter %s page %d: %d results", chapter, page, len(results))
 
-                # FIX 3 — fetch all dockets in this page concurrently (4 workers)
+                # FIX 3 â€” fetch all dockets in this page concurrently (4 workers)
                 new_recs = self._fetch_dockets_parallel(session, results, chapter)
                 for rec in new_recs:
                     records.append(rec)
@@ -1022,16 +1022,16 @@ class BankruptcyScraper:
                     break
 
                 time.sleep(0.3)
-                # CourtListener blocks past page 100 — date-chunk workaround
+                # CourtListener blocks past page 100 â€” date-chunk workaround
                 if page >= 99:
                     dates = [r.get("date_filed", "") for r in results if r.get("date_filed")]
                     if dates:
                         oldest = min(dates)
-                        # FIX 2 — stop if we've already reached or passed the cutoff
+                        # FIX 2 â€” stop if we've already reached or passed the cutoff
                         if oldest <= cutoff:
-                            log.info("BK Ch.%s reached cutoff at page 99 — stopping", chapter)
+                            log.info("BK Ch.%s reached cutoff at page 99 â€” stopping", chapter)
                             break
-                        log.info("BK Ch.%s hit page 99 — restarting from %s", chapter, oldest)
+                        log.info("BK Ch.%s hit page 99 â€” restarting from %s", chapter, oldest)
                         params["docket__date_filed__lte"] = oldest
                         params["page"] = 1
                         next_url = CL_BK_URL
@@ -1042,7 +1042,7 @@ class BankruptcyScraper:
                     next_url = next_link
                     page    += 1
                     if page > MAX_PAGES:
-                        log.info("BK Ch.%s hit MAX_PAGES %d — stopping", chapter, MAX_PAGES)
+                        log.info("BK Ch.%s hit MAX_PAGES %d â€” stopping", chapter, MAX_PAGES)
                         break
 
                 time.sleep(0.3)
@@ -1142,7 +1142,7 @@ class BankruptcyScraper:
 
 
 # ===========================================================================
-# Parcel Enrichment — DCAD ArcGIS
+# Parcel Enrichment â€” DCAD ArcGIS
 # ===========================================================================
 
 class ParcelLookup:
@@ -1150,8 +1150,8 @@ class ParcelLookup:
     Enriches records with owner, mailing address, homestead flag, and
     appraised value from the Dallas Central Appraisal District ArcGIS API.
 
-    FIX 1 — addresses are now normalized to match DCAD's ALL-CAPS format
-    and common suffix variants (e.g. Boulevard → BLVD) before querying.
+    FIX 1 â€” addresses are now normalized to match DCAD's ALL-CAPS format
+    and common suffix variants (e.g. Boulevard â†’ BLVD) before querying.
     The [:20] street slice that cut names mid-word is also removed.
     """
 
@@ -1204,7 +1204,7 @@ class ParcelLookup:
             "HOMESTEAD_EXEMPT,APPRAISED_VALUE,LUC,LUC_DESC"
         )
 
-        # --- 1. Spatial lookup (most precise — uses GPS coordinates from LGBS) ---
+        # --- 1. Spatial lookup (most precise â€” uses GPS coordinates from LGBS) ---
         if lat is not None and lng is not None:
             try:
                 params = {
@@ -1280,7 +1280,7 @@ class ParcelLookup:
             rec["prop_city"]    = (attrs.get("SITUS_CITY") or "Dallas").strip().title()
             rec["prop_zip"]     = str(attrs.get("SITUS_ZIP") or "").strip()
         elif situs_street and not rec.get("prop_address"):
-            # DCAD has street but no number — only fill if record has nothing yet
+            # DCAD has street but no number â€” only fill if record has nothing yet
             rec["prop_address"] = situs_street
             rec["prop_city"]    = (attrs.get("SITUS_CITY") or "Dallas").strip().title()
             rec["prop_zip"]     = str(attrs.get("SITUS_ZIP") or "").strip()
@@ -1323,7 +1323,7 @@ class ParcelLookup:
 class NominatimGeocoder:
     """
     Reverse-geocodes records that have coordinates but no house number.
-    Uses OpenStreetMap Nominatim — free, no key, 1 req/sec limit.
+    Uses OpenStreetMap Nominatim â€” free, no key, 1 req/sec limit.
     Only called for TAXSALE records where DCAD returned no SITUS_NUM.
     """
 
@@ -1395,11 +1395,11 @@ class LeadScorer:
     def score(rec: dict, owner_cats_index: dict) -> tuple:
         """
         Score a single record.
-        owner_cats_index: pre-built dict of normalized_owner → set of cats
-                          (built once in main() to avoid O(n²) scanning).
-        FIX 5 — WEEK_AGO now computed fresh inside score() instead of
+        owner_cats_index: pre-built dict of normalized_owner â†’ set of cats
+                          (built once in main() to avoid O(nÂ²) scanning).
+        FIX 5 â€” WEEK_AGO now computed fresh inside score() instead of
                  being frozen at import time.
-        FIX 6 — cross-signal stacking uses the pre-built index instead of
+        FIX 6 â€” cross-signal stacking uses the pre-built index instead of
                  scanning all_recs on every call.
         """
         week_ago = datetime.now() - timedelta(days=7)  # FIX 5
@@ -1432,7 +1432,7 @@ class LeadScorer:
             flags.append(f"Bankruptcy Ch.{chapter}" if chapter else "Bankruptcy")
             points += 20
 
-        # Cross-signal stacking — FIX 6: use pre-built index, not a full scan
+        # Cross-signal stacking â€” FIX 6: use pre-built index, not a full scan
         norm = normalize_name(owner)
         if norm:
             owner_cats = owner_cats_index.get(norm, set())
@@ -1448,7 +1448,7 @@ class LeadScorer:
             if   amt > 100_000: flags.append("High debt (>$100k)"); points += 15
             elif amt >  50_000: points += 8
 
-        # Recency — FIX 5: uses local week_ago computed above
+        # Recency â€” FIX 5: uses local week_ago computed above
         try:
             dt = datetime.strptime(rec.get("filed", "").strip(), "%m/%d/%Y")
             if dt >= week_ago:
@@ -1525,7 +1525,7 @@ def export_ghl_csv(records: list, path: Path):
 # ===========================================================================
 
 def main():
-    log.info("Dallas Intel scraper starting — lookback %d days", LOOKBACK_DAYS)
+    log.info("Dallas Intel scraper starting â€” lookback %d days", LOOKBACK_DAYS)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DASHBOARD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1557,7 +1557,7 @@ def main():
     all_records = lookup.enrich(all_records)
 
     # 7. Score
-    # FIX 6 — build owner→categories index once here so scoring is O(n) not O(n²)
+    # FIX 6 â€” build ownerâ†’categories index once here so scoring is O(n) not O(nÂ²)
     owner_cats_index: dict = defaultdict(set)
     for r in all_records:
         n = normalize_name(r.get("owner", ""))
@@ -1571,7 +1571,7 @@ def main():
     all_records.sort(key=lambda r: r.get("score", 0), reverse=True)
 
     hot = sum(1 for r in all_records if r.get("score", 0) >= 70)
-    log.info("Scoring complete. Total=%d  Hot(≥70)=%d  Max=%d",
+    log.info("Scoring complete. Total=%d  Hot(â‰¥70)=%d  Max=%d",
              len(all_records), hot,
              max((r.get("score", 0) for r in all_records), default=0))
 
@@ -1586,3 +1586,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
