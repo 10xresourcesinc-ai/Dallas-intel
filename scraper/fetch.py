@@ -1231,8 +1231,13 @@ class ParcelLookup:
         queries = []
 
         if parcel:
-            clean_parcel = re.sub(r"[\s\-]", "", parcel)
-            queries.append(f"ACCOUNT_NUM='{clean_parcel}'")
+            subdiv_m = re.search(r"Name:\s*([A-Z0-9 ]+?)(?:\s+Lot|\s+Reference|\s*$)", parcel, re.I)
+            if subdiv_m:
+                subdiv = subdiv_m.group(1).strip()
+                queries.append(f"LEGAL_DESC LIKE '%{subdiv}%' AND SITUS_NUM IS NOT NULL")
+            elif not re.search(r"Subdivision|Lot|Block", parcel, re.I):
+                clean_parcel = re.sub(r"[\s\-]", "", parcel)
+                queries.append(f"ACCOUNT_NUM='{clean_parcel}'")
 
         if address:
             num_match = re.match(r"^(\d+)\s+(.+?)(?:,|$)", address)
@@ -1586,4 +1591,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
