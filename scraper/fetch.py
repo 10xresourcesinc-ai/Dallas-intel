@@ -74,7 +74,7 @@ DALLAS_311_URL      = "https://www.dallasopendata.com/resource/dkp4-ix7s.json"
 DALLAS_PUBLICSEARCH = "https://dallas.tx.publicsearch.us"
 LGBS_TAXSALE_URL    = "http://taxsales.lgbs.com/dallas/list"
 DCAD_URL            = ("https://maps.dcad.org/prdwa/rest/services/"
-                       "Property/PropertySearch/MapServer/0/query")
+                       "Property/ParcelQuery/MapServer/4/query")
 CL_BK_URL           = "https://www.courtlistener.com/api/rest/v4/bankruptcy-information/"
 CL_BK_COURT         = "txnb"
 
@@ -1163,7 +1163,7 @@ class ParcelLookup:
         try:
             r = self._session.get(DCAD_URL, params={
                 "where":             "ACCOUNT_NUM='00832550000000000'",
-                "outFields":         "ACCOUNT_NUM,OWNER_NAME,SITUS_NUM,SITUS_STREET",
+                "outFields":         "SITEADDRESS,OWNERNME1,CNVYNAME,PSTLADDRESS,PSTLCITY,PSTLSTATE,PSTLZIP5",
                 "f":                 "json",
                 "resultRecordCount": 1,
                 "returnGeometry":    "false",
@@ -1199,9 +1199,7 @@ class ParcelLookup:
                 lat: float = None, lng: float = None) -> Optional[dict]:
 
         OUT_FIELDS = (
-            "ACCOUNT_NUM,OWNER_NAME,SITUS_NUM,SITUS_STREET,SITUS_CITY,"
-            "SITUS_ZIP,MAIL_ADDR1,MAIL_CITY,MAIL_STATE,MAIL_ZIP,"
-            "HOMESTEAD_EXEMPT,APPRAISED_VALUE,LUC,LUC_DESC"
+            "SITEADDRESS,OWNERNME1,CNVYNAME,PSTLADDRESS,PSTLCITY,PSTLSTATE,PSTLZIP5,CNTASSDVAL,USECD,USEDSCRP"
         )
 
         # --- 1. Spatial lookup (most precise â€” uses GPS coordinates from LGBS) ---
@@ -1234,7 +1232,7 @@ class ParcelLookup:
             subdiv_m = re.search(r"Name:\s*([A-Z0-9 ]+?)(?:\s+Lot|\s+Reference|\s*$)", parcel, re.I)
             if subdiv_m:
                 subdiv = subdiv_m.group(1).strip()
-                queries.append(f"LEGAL_DESC LIKE '%{subdiv}%' AND SITUS_NUM IS NOT NULL")
+                queries.append(f"CNVYNAME LIKE '%{subdiv}%'")
             elif not re.search(r"Subdivision|Lot|Block", parcel, re.I):
                 clean_parcel = re.sub(r"[\s\-]", "", parcel)
                 queries.append(f"ACCOUNT_NUM='{clean_parcel}'")
@@ -1244,12 +1242,12 @@ class ParcelLookup:
             if num_match:
                 num    = num_match.group(1)
                 street = _normalize_street_for_dcad(num_match.group(2).strip().split(",")[0])
-                queries.append(f"SITUS_NUM='{num}' AND SITUS_STREET LIKE '%{street}%'")
+                queries.append(f"SITEADDRESS LIKE '{num} {street}%'")
             else:
                 street_raw = address.split(",")[0].strip()
                 if street_raw:
                     street = _normalize_street_for_dcad(street_raw)
-                    queries.append(f"SITUS_STREET LIKE '%{street}%'")
+                    queries.append(f"SITEADDRESS LIKE '%{street}%'")
 
         for where in queries:
             try:
@@ -1291,12 +1289,12 @@ class ParcelLookup:
             rec["prop_zip"]     = str(attrs.get("SITUS_ZIP") or "").strip()
 
         if not rec.get("owner"):
-            rec["owner"] = (attrs.get("OWNER_NAME") or "").strip().title()
+            rec["owner"] = (attrs.get("OWNERNME1") or "").strip().title()
 
-        mail_addr  = (attrs.get("MAIL_ADDR1")  or "").strip().title()
-        mail_city  = (attrs.get("MAIL_CITY")   or "").strip().title()
-        mail_state = (attrs.get("MAIL_STATE")  or "TX").strip().upper()
-        mail_zip   = str(attrs.get("MAIL_ZIP") or "").strip()
+        mail_addr  = (attrs.get("PSTLADDRESS") or "").strip().title()
+        mail_city  = (attrs.get("PSTLCITY")    or "").strip().title()
+        mail_state = (attrs.get("PSTLSTATE")   or "TX").strip().upper()
+        mail_zip   = str(attrs.get("PSTLZIP5") or "").strip()
         if mail_addr:
             rec["mail_address"] = mail_addr
             rec["mail_city"]    = mail_city
@@ -1304,16 +1302,16 @@ class ParcelLookup:
             rec["mail_zip"]     = mail_zip
             rec["out_of_state"] = mail_state not in ("", "TX")
 
-        rec["homestead"] = bool(attrs.get("HOMESTEAD_EXEMPT"))
-        appr = attrs.get("APPRAISED_VALUE")
+        rec["homestead"] = None
+        appr = attrs.get("CNTASSDVAL")
         if appr:
             try:
                 rec["appraised"] = f"${float(appr):,.0f}"
             except Exception:
                 rec["appraised"] = str(appr)
 
-        rec["luc"]      = str(attrs.get("LUC") or "").strip()
-        rec["luc_desc"] = (attrs.get("LUC_DESC") or "").strip()
+        rec["luc"]      = str(attrs.get("USECD") or "").strip()
+        rec["luc_desc"] = (attrs.get("USEDSCRP") or "").strip()
 
         acct = str(attrs.get("ACCOUNT_NUM") or "").strip()
         if acct and not rec.get("legal"):
