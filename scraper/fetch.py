@@ -1229,7 +1229,7 @@ class ParcelLookup:
         queries = []
 
         if parcel:
-            subdiv_m = re.search(r"Name:\s*([A-Z0-9]+)", parcel, re.I)
+            subdiv_m = re.search(r"Name:\s*((?:[A-Z0-9]+\s+){1,2}[A-Z0-9]+)", parcel, re.I)
             lot_m    = re.search(r"Lot:\s*(\S+)", parcel, re.I)
             block_m  = re.search(r"Block:\s*(\S+)", parcel, re.I)
             if subdiv_m and lot_m and block_m:
@@ -1238,11 +1238,11 @@ class ParcelLookup:
                 block  = block_m.group(1).strip()
                 queries.append(
                     f"CNVYNAME LIKE '%{subdiv}%' AND "
-                    f"PRPRTYDSCRP LIKE '%BLK%{block}%LT%{lot}%'"
+                    f"PRPRTYDSCRP LIKE '%BLK%{block}%LT {lot} %'"
                 )
                 queries.append(
                     f"CNVYNAME LIKE '%{subdiv}%' AND "
-                    f"PRPRTYDSCRP LIKE '%BLK%{block}%LOT%{lot}%'"
+                    f"PRPRTYDSCRP LIKE '%BLK%{block}%LOT {lot} %'"
                 )
             elif subdiv_m:
                 queries.append(f"CNVYNAME LIKE '%{subdiv_m.group(1).strip()}%'")
@@ -1564,7 +1564,8 @@ def main():
     log.info("Total after LP: %d", len(all_records))
 
     # 5. Bankruptcy
-    all_records.extend(BankruptcyScraper().fetch())
+    # BK disabled - low quality leads, CourtListener blocked from GitHub Actions IPs
+    # all_records.extend(BankruptcyScraper().fetch())
     log.info("Total after BK: %d", len(all_records))
 
     # 6. Parcel enrichment
