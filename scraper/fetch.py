@@ -1229,10 +1229,23 @@ class ParcelLookup:
         queries = []
 
         if parcel:
-            subdiv_m = re.search(r"Name:\s*([A-Z0-9 ]+?)(?:\s+Lot|\s+Reference|\s*$)", parcel, re.I)
-            if subdiv_m:
+            subdiv_m = re.search(r"Name:\s*([A-Z0-9]+)", parcel, re.I)
+            lot_m    = re.search(r"Lot:\s*(\S+)", parcel, re.I)
+            block_m  = re.search(r"Block:\s*(\S+)", parcel, re.I)
+            if subdiv_m and lot_m and block_m:
                 subdiv = subdiv_m.group(1).strip()
-                queries.append(f"CNVYNAME LIKE '%{subdiv}%'")
+                lot    = lot_m.group(1).strip()
+                block  = block_m.group(1).strip()
+                queries.append(
+                    f"CNVYNAME LIKE '%{subdiv}%' AND "
+                    f"PRPRTYDSCRP LIKE '%BLK%{block}%LT%{lot}%'"
+                )
+                queries.append(
+                    f"CNVYNAME LIKE '%{subdiv}%' AND "
+                    f"PRPRTYDSCRP LIKE '%BLK%{block}%LOT%{lot}%'"
+                )
+            elif subdiv_m:
+                queries.append(f"CNVYNAME LIKE '%{subdiv_m.group(1).strip()}%'")
             elif not re.search(r"Subdivision|Lot|Block", parcel, re.I):
                 clean_parcel = re.sub(r"[\s\-]", "", parcel)
                 queries.append(f"ACCOUNT_NUM='{clean_parcel}'")
