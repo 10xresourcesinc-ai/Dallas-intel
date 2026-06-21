@@ -69,7 +69,7 @@ COURTLISTENER_TOKEN = os.getenv("COURTLISTENER_TOKEN", "")
 # Data source URLs
 # ---------------------------------------------------------------------------
 
-DALLAS_CODE_URL     = "https://www.dallasopendata.com/resource/x9pz-kdq9.json"
+DALLAS_CODE_URL     = "https://www.dallasopendata.com/resource/gc4d-8a49.json"
 DALLAS_311_URL      = "https://www.dallasopendata.com/resource/dkp4-ix7s.json"
 DALLAS_PUBLICSEARCH = "https://dallas.tx.publicsearch.us"
 LGBS_TAXSALE_URL    = "http://taxsales.lgbs.com/dallas/list"
@@ -162,8 +162,6 @@ class DallasCodeScraper:
         records = []
 
         sources = [
-            (DALLAS_311_URL,  "311 active",  "$where",
-             "service_type_description like '%CODE%' OR service_type_description like '%STRUCT%'"),
             (DALLAS_CODE_URL, "violations",  None, None),
         ]
 
@@ -178,7 +176,7 @@ class DallasCodeScraper:
                     params = {
                         "$limit":  limit,
                         "$offset": offset,
-                        "$order":  "created_date DESC" if "311" in label else "created DESC",
+                        "$order":  "created_date DESC",
                     }
                     if where_key and where_val:
                         params[where_key] = where_val
@@ -222,9 +220,10 @@ class DallasCodeScraper:
         if not address:
             return None
 
-        nuisance = (row.get("nuisance") or
+        nuisance = (row.get("service_request_type") or
+                    row.get("nuisance") or
                     row.get("service_type_description") or "").strip()
-        vtype    = (row.get("type") or nuisance or "Other").strip()
+        vtype    = (nuisance or row.get("type") or "Other").strip()
         structural_kws = ("struct", "foundation", "roof", "wall", "unsafe", "substandard",
                           "demolish", "board", "vacant")
         if any(k in vtype.lower() for k in structural_kws):
@@ -247,9 +246,10 @@ class DallasCodeScraper:
         zipcode = str(row.get("zip_code") or row.get("zone") or "").strip()
 
         return {
-            "doc_num":       str(row.get("service_request_num") or
+            "doc_num":       str(row.get("service_request_number") or
+                              row.get("service_request_num") or
                               row.get("service_request_id") or
-                              row.get("service_request") or ""),
+                              row.get("unique_key") or ""),
             "doc_type":      vtype.upper().replace(" ", "_")[:20],
             "cat":           cat,
             "cat_label":     "Substandard Structure" if sev == "high" else "Code Violation",
