@@ -156,148 +156,159 @@ class DallasCodeScraper:
         "Other": "low",
     }
 
+    HIGH_PRIORITY = {"Emergency", "Priority", "High"}
+    INCLUDE_TYPES = (
+        "Code Concern - CCS",
+        "Single Family Rental Needs Registration - CCS",
+        "Boarding Home Complaint - CCS",
+        "Boarding Home Facilities - CCS",
+        "Emergency Regulations Violation - CCS",
+        "Illegal Dumping Sign - CCS",
+    )
+
     def fetch(self) -> list:
-        log.info("Scraping Dallas code violations (Socrata)â€¦")
-        session = make_session()
-        records = []
+        log.info("Scraping Dallas code violations (Socrata)...")
+        session  = make_session()
+        all_rows = []
+        offset   = 0
+        limit    = 1000
+        where    = (
+            "service_request_type in("
+            + ",".join(f"\'{t}\'" for t in self.INCLUDE_TYPES)
+            + ")"
+        )
 
-        sources = [
-            (DALLAS_CODE_URL, "violations",  None, None),
-        ]
-
-        for url, label, where_key, where_val in sources:
-            offset      = 0
-            limit       = 1000
-            batch_total = 0
-            while True:
-                try:
-                    # FIX 4 â€” violations dataset sort field was "updated DESC" which
-                    # doesn't exist; the real field is "created DESC".
-                    params = {
-                        "$limit":  limit,
-                        "$offset": offset,
-                        "$order":  "created_date DESC",
-                    }
-                    if where_key and where_val:
-                        params[where_key] = where_val
-                    r = session.get(url, params=params, timeout=30)
-                    if r.status_code != 200:
-                        log.warning("Socrata %s HTTP %d â€” %s",
-                                    label, r.status_code, r.text[:200])
-                        break
-                    batch = r.json()
-                    if not batch:
-                        break
-                    batch_total += len(batch)
-                    for row in batch:
-                        rec = self._to_record(row)
-                        if rec:
-                            records.append(rec)
-                    if len(batch) < limit:
-                        break
-                    offset += limit
-                    if "violations" in label and offset >= 10000:
-                        break
-                    time.sleep(0.3)
-                except Exception as e:
-                    log.warning("Socrata %s error: %s", label, e)
+        while True:
+            try:
+                params = {
+                    "$limit":  limit,
+                    "$offset": offset,
+                    "$order":  "created_date DESC",
+                    "$where":  where,
+                }
+                r = session.get(DALLAS_CODE_URL, params=params, timeout=30)
+                if r.status_code != 200:
+                    log.warning("Socrata CODE HTTP %d - %s", r.status_code, r.text[:200])
                     break
-            log.info("Code violations %s: %d rows fetched", label, batch_total)
-            if records:
-                break  # Got results from primary source, skip fallback
+                batch = r.json()
+                if not batch:
+                    break
+                all_rows.extend(batch)
+                if len(batch) < limit or offset >= 20000:
+                    break
+                offset += limit
+                time.sleep(0.3)
+            except Exception as e:
+                log.warning("Socrata CODE error: %s", e)
+                break
 
-        log.info("Code violations total: %d records", len(records))
+        log.info("Code violations fetched: %d rows", len(all_rows))
+
+        from collections import Counter
+        addr_counts = Counter(
+            (row.get("address") or "").strip().upper()
+            for row in all_rows if row.get("address")
+        )
+
+        records = []
+        for row in all_rows:
+            priority = (row.get("priority") or "Standard").strip()
+            addr     = (row.get("address") or "").strip().upper()
+            repeat   = addr_counts.get(addr, 0) >= 2
+
+            if priority == "Standard" and not repeat:
+                continue
+
+            rec = self._to_record(row, priority, repeat)
+            if rec:
+                records.append(rec)
+
+        log.info("Code violations total: %d records (after distress filtering)", len(records))
         return records
 
-    def _to_record(self, row: dict) -> Optional[dict]:
+    def _to_record(self, row: dict, priority: str = "Standard", repeat: bool = False) -> Optional[dict]:
         address = (row.get("address") or "").strip().title()
-        if not address:
-            str_num    = str(row.get("str_num") or "").strip()
-            str_prefix = (row.get("str_prefix") or "").strip()
-            str_nam    = (row.get("str_nam") or "").strip()
-            str_suffix = (row.get("str_suffix") or "").strip()
-            address    = " ".join(filter(None, [str_num, str_prefix, str_nam, str_suffix])).title()
         if not address:
             return None
 
-        nuisance = (row.get("service_request_type") or
-                    row.get("nuisance") or
-                    row.get("service_type_description") or "").strip()
-        vtype    = (nuisance or row.get("type") or "Other").strip()
-        structural_kws = ("struct", "foundation", "roof", "wall", "unsafe", "substandard",
-                          "demolish", "board", "vacant")
-        if any(k in vtype.lower() for k in structural_kws):
+        stype   = (row.get("service_request_type") or "Other").strip()
+        status  = (row.get("status") or "").strip()
+
+        # Determine severity from priority field
+        if priority in self.HIGH_PRIORITY:
             sev = "high"
-        elif any(k in vtype.lower() for k in ("zoning", "permit")):
+            cat = "CODE_STRUCT"
+            cat_label = "Substandard Structure"
+        elif repeat:
             sev = "medium"
+            cat = "CODE_STRUCT"
+            cat_label = "Repeat Violation"
         else:
             sev = "low"
-        cat = "CODE_STRUCT" if sev == "high" else "CODE"
+            cat = "CODE"
+            cat_label = "Code Violation"
 
-        filed_raw = (row.get("created_date") or row.get("created") or
-                     row.get("date_filed") or "")
+        # Build distress flags
+        flags = []
+        if priority == "Emergency":
+            flags.append("Emergency priority")
+        elif priority == "Priority":
+            flags.append("High priority")
+        if repeat:
+            flags.append("Repeat violation")
+        if "rental" in stype.lower():
+            flags.append("Unregistered rental")
+        if "boarding" in stype.lower():
+            flags.append("Boarding home")
+        if "dumping" in stype.lower():
+            flags.append("Illegal dumping")
+
+        filed_raw = (row.get("created_date") or row.get("update_date") or "")
         filed = ""
         if filed_raw:
             try:
-                filed = datetime.fromisoformat(filed_raw[:10]).strftime("%m/%d/%Y")
+                filed = __import__("datetime").datetime.fromisoformat(filed_raw[:10]).strftime("%m/%d/%Y")
             except Exception:
                 filed = filed_raw[:10]
 
-        zipcode = str(row.get("zip_code") or row.get("zone") or "").strip()
+        # Parse city/zip from address field e.g. "1234 MAIN ST, DALLAS, TX, 75201"
+        prop_city = "Dallas"
+        prop_zip  = ""
+        parts = address.split(",")
+        if len(parts) >= 3:
+            prop_city = parts[1].strip().title()
+        if len(parts) >= 4:
+            prop_zip = parts[3].strip()
 
         return {
-            "doc_num":       str(row.get("service_request_number") or
-                              row.get("service_request_num") or
-                              row.get("service_request_id") or
-                              row.get("unique_key") or ""),
-            "doc_type":      vtype.upper().replace(" ", "_")[:20],
+            "doc_num":       str(row.get("service_request_number") or row.get("unique_key") or ""),
+            "doc_type":      f"CODE-{priority.upper()[:4]}",
             "cat":           cat,
-            "cat_label":     "Substandard Structure" if sev == "high" else "Code Violation",
+            "cat_label":     cat_label,
             "filed":         filed,
-            "owner":         (row.get("owner_name") or "").strip().title(),
+            "owner":         "",
             "grantee":       "",
             "amount":        None,
-            "legal":         (row.get("parcel_id") or row.get("account_number") or "").strip(),
+            "legal":         "",
             "clerk_url":     "",
-            "prop_address":  address,
-            "prop_city":     "Dallas",
+            "prop_address":  parts[0].strip().title() if parts else address,
+            "prop_city":     prop_city,
             "prop_state":    "TX",
-            "prop_zip":      zipcode,
+            "prop_zip":      prop_zip,
             "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
             "source":        "Dallas Code Enforcement",
-            "neighborhood":  (row.get("department") or ""),
-            "viol_status":   (row.get("status") or "").strip(),
-            "viol_desc":     nuisance or vtype,
+            "neighborhood":  (row.get("city_council_district") or ""),
+            "viol_status":   status,
+            "viol_desc":     f"{stype} [{priority}]{'  REPEAT' if repeat else ''}",
             "viol_severity": sev,
             "delinquent":    False, "delinq_amt": "",
             "homestead":     None,
             "appraised":     "",
             "out_of_state":  False,
-            "luc":           "",
-            "luc_desc":      "",
+            "luc":           "", "luc_desc": "",
             "score":         0,
-            "flags":         [],
+            "flags":         flags,
         }
-
-
-# ===========================================================================
-# Source: NOFC + LP â€” Dallas County Clerk PublicSearch
-# Uses quickSearch API matching the browser URL.
-# Also pulls Lis Pendens (replaces manual PDF upload).
-# Self-hosted runner required â€” site blocks GitHub Actions IPs.
-# ===========================================================================
-
-class DallasPublicSearchScraper:
-    BASE       = "https://dallas.tx.publicsearch.us"
-    SEARCH_URL = "https://dallas.tx.publicsearch.us/results"
-    DOC_URL    = "https://dallas.tx.publicsearch.us/doc/{}"
-
-    SEARCHES = [
-        ("trustee sale", "NOFC", "Notice of Foreclosure"),
-        ("foreclosure",  "NOFC", "Notice of Foreclosure"),
-        ("lis pendens",  "LP",   "Lis Pendens"),
-    ]
-
     def _make_session(self):
         s = make_session()
         s.headers.update({
