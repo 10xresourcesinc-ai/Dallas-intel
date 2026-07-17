@@ -652,6 +652,360 @@ class DallasCodeScraper:
             log.debug("PublicSearch doc %s error: %s", doc_id, e)
             return None
 
+class DallasPublicSearchScraper:
+    BASE       = "https://dallas.tx.publicsearch.us"
+    SEARCH_URL = "https://dallas.tx.publicsearch.us/results"
+    DOC_URL    = "https://dallas.tx.publicsearch.us/doc/{}"
+
+    SEARCHES = [
+        ("trustee sale", "NOFC", "Notice of Foreclosure"),
+        ("foreclosure",  "NOFC", "Notice of Foreclosure"),
+        ("lis pendens",  "LP",   "Lis Pendens"),
+    ]
+
+    def _make_session(self):
+        s = make_session()
+        s.headers.update({
+            "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer":         "https://dallas.tx.publicsearch.us/",
+        })
+        return s
+
+    def fetch(self) -> list:
+        log.info("Scraping Dallas County PublicSearch via Playwright (NOFC + LP)...")
+        try:
+            import asyncio as _asyncio
+            from playwright.async_api import async_playwright as _apw
+        except ImportError:
+            log.error("Playwright not installed â€” run: pip install playwright && python -m playwright install chromium")
+            return []
+
+        cutoff     = LOOKBACK_DATE.date()
+        start_str  = cutoff.strftime("%Y%m%d")
+        end_str    = date.today().strftime("%Y%m%d")
+        LIMIT      = 50
+        BARGS      = ["--no-sandbox", "--disable-setuid-sandbox",
+                      "--disable-dev-shm-usage", "--disable-gpu"]
+
+        async def _get_rows(page):
+            return await page.evaluate("""() => {
+                const out = [];
+                for (const tr of document.querySelectorAll('tbody tr')) {
+                    const cb = tr.querySelector('input[id^="table-checkbox-"]');
+                    if (!cb) continue;
+                    const id = cb.id.replace('table-checkbox-', '');
+                    const c = i => { const e = tr.querySelector('.col-'+i+' span'); return e ? e.innerText.trim() : ''; };
+                    out.push({id, g3:c(3), g4:c(4), g5:c(5), g6:c(6), g7:c(7), g9:c(9), g10:c(10)});
+                }
+                const m = document.body.innerText.match(/([0-9][0-9,]+)\s+results/);
+                return {rows: out, total: m ? parseInt(m[1].replace(/,/g,'')) : 0};
+            }""")
+
+        async def _load_page(pw, url):
+            for attempt in range(3):
+                browser = await pw.chromium.launch(headless=True, args=BARGS)
+                try:
+                    ctx  = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                    page = await ctx.new_page()
+                    await page.goto("https://dallas.tx.publicsearch.us/", wait_until="domcontentloaded", timeout=60000)
+                    await _asyncio.sleep(2)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                    await _asyncio.sleep(3)
+                    for _ in range(27):
+                        data = await _get_rows(page)
+                        if data["rows"]: return data
+                        await _asyncio.sleep(1)
+                    return await _get_rows(page)
+                except Exception as e:
+                    log.warning("PublicSearch load attempt %d: %s", attempt+1, e)
+                    await _asyncio.sleep(3)
+                finally:
+                    await browser.close()
+            return {"rows": [], "total": 0}
+
+        async def _scrape_one(pw, search_val, cat, cat_label):
+            base = (f"https://dallas.tx.publicsearch.us/results"
+                    f"?department=RP&searchType=quickSearch"
+                    f"&searchValue={search_val.replace(' ', '+')}"
+                    f"&recordedDateRange={start_str},{end_str}&limit={LIMIT}")
+            seen, recs = set(), []
+            total, offset, pnum = 9999, 0, 1
+            while offset < total:
+                data = await _load_page(pw, f"{base}&offset={offset}")
+                if pnum == 1:
+                    total = data["total"] or 9999
+                    log.info("PublicSearch '%s' total=%d", search_val, total)
+                batch = data["rows"]
+                log.info("PublicSearch '%s' page %d rows=%d", search_val, pnum, len(batch))
+                if not batch: break
+                for r in batch:
+                    key = r["g7"] or r["id"]
+                    if key in seen: continue
+                    seen.add(key)
+                    # parse date
+                    filed = ""
+                    try: filed = datetime.strptime(r["g6"].strip(), "%m/%d/%Y").strftime("%m/%d/%Y")
+                    except Exception: filed = r["g6"][:10] if r["g6"] else ""
+                    # extract address from legal desc
+                    address = ""
+                    m = re.search(r"(\d+\s+\S+(?:\s+\S+){1,5}(?:ST|AVE|BLVD|DR|RD|LN|CT|WAY|PL|TRL|PKWY))",
+                                  r["g10"], re.I)
+                    if m: address = m.group(1).strip().title()
+                    recs.append({
+                        "doc_num":      r["g7"] or r["id"],
+                        "doc_type":     r["g5"],
+                        "cat":          cat,
+                        "cat_label":    cat_label,
+                        "filed":        filed,
+                        "owner":        r["g3"].strip().title(),
+                        "grantee":      r["g4"].strip().title(),
+                        "amount":       None,
+                        "legal":        r["g10"][:200],
+                        "clerk_url":    f"https://dallas.tx.publicsearch.us/doc/{r['id']}",
+                        "prop_address": address,
+                        "prop_city":    r["g9"].strip().title() or "Dallas",
+                        "prop_state":   "TX",
+                        "prop_zip":     "",
+                        "mail_address": "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
+                        "source":       "Dallas County Clerk",
+                        "neighborhood": "", "viol_status": r["g5"], "viol_desc": r["g5"],
+                        "viol_severity": "high",
+                        "delinquent":   False, "delinq_amt": "",
+                        "homestead":    None,  "appraised":  "",
+                        "out_of_state": False,
+                        "luc":          "", "luc_desc": "",
+                        "score":        0,  "flags":    [],
+                    })
+                offset += LIMIT; pnum += 1
+                if offset < total: await _asyncio.sleep(2)
+            return recs
+
+        async def _run():
+            all_recs = []
+            async with _apw() as pw:
+                for sv, cat, label in self.SEARCHES:
+                    recs = await _scrape_one(pw, sv, cat, label)
+                    log.info("PublicSearch '%s': %d records", sv, len(recs))
+                    all_recs.extend(recs)
+            # dedup by doc_num
+            seen, out = set(), []
+            for r in all_recs:
+                if r["doc_num"] not in seen:
+                    seen.add(r["doc_num"]); out.append(r)
+            log.info("PublicSearch: %d records parsed from table", len(out))
+            return out
+
+        return _asyncio.run(_run())
+
+    def _parse_api_item(self, item: dict, cat: str, cat_label: str) -> Optional[dict]:
+        """Parse a JSON item from the PublicSearch API."""
+        try:
+            doc_id   = str(item.get("id") or item.get("docId") or item.get("documentId") or "")
+            doc_num  = str(item.get("documentNumber") or item.get("doc_number") or item.get("docNumber") or doc_id)
+            doc_type = (item.get("documentType") or item.get("docType") or cat).strip()
+            recorded = (item.get("recordedDate") or item.get("recorded_date") or "").strip()
+            grantor  = (item.get("grantor") or item.get("grantorName") or "").strip()
+            grantee  = (item.get("grantee") or item.get("granteeName") or "").strip()
+            legal    = (item.get("legalDescription") or item.get("legal") or "").strip()
+            town     = (item.get("city") or item.get("town") or "Dallas").strip()
+
+            filed = ""
+            try:
+                filed = datetime.strptime(recorded[:10], "%Y-%m-%d").strftime("%m/%d/%Y")
+            except Exception:
+                try:
+                    filed = datetime.strptime(recorded[:10], "%m/%d/%Y").strftime("%m/%d/%Y")
+                except Exception:
+                    filed = recorded[:10]
+
+            address = ""
+            m = re.search(r"(\d+\s+\S+(?:\s+\S+){1,5}(?:ST|AVE|BLVD|DR|RD|LN|CT|WAY|PL|TRL|PKWY))",
+                          legal, re.I)
+            if m:
+                address = m.group(1).strip().title()
+
+            clerk_url = f"https://dallas.tx.publicsearch.us/doc/{doc_id}" if doc_id else ""
+
+            if not grantor and not doc_num:
+                return None
+
+            return {
+                "doc_num":       doc_num,
+                "doc_type":      doc_type,
+                "cat":           cat,
+                "cat_label":     cat_label,
+                "filed":         filed,
+                "owner":         grantor.title(),
+                "grantee":       grantee.title(),
+                "amount":        None,
+                "legal":         legal[:200],
+                "clerk_url":     clerk_url,
+                "prop_address":  address,
+                "prop_city":     town.title() or "Dallas",
+                "prop_state":    "TX",
+                "prop_zip":      "",
+                "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
+                "source":        "Dallas County Clerk",
+                "neighborhood":  "", "viol_status": "", "viol_desc": "",
+                "viol_severity": "",
+                "delinquent":    False, "delinq_amt": "",
+                "homestead":     None, "appraised":  "",
+                "out_of_state":  False,
+                "luc":           "", "luc_desc": "",
+                "score":         0,  "flags":    [],
+            }
+        except Exception as e:
+            log.debug("PublicSearch API item parse error: %s", e)
+            return None
+
+    def _parse_row(self, row, cat: str, cat_label: str) -> Optional[dict]:
+        """Parse a table row directly â€” all data is in col-0 through col-10."""
+        try:
+            # Doc ID from checkbox id: "table-checkbox-314313835"
+            chk = row.select_one("input[id^='table-checkbox-']")
+            if not chk:
+                return None
+            internal_id = chk["id"].replace("table-checkbox-", "").strip()
+
+            def col(n):
+                el = row.select_one(f".col-{n} span")
+                return el.get_text(strip=True) if el else ""
+
+            grantor  = col(3)
+            grantee  = col(4)
+            doc_type = col(5)
+            recorded = col(6)
+            doc_num  = col(7)
+            town     = col(9)
+            legal    = col(10)
+
+            if not grantor and not doc_num:
+                return None
+
+            # Parse date
+            filed = ""
+            try:
+                filed = datetime.strptime(recorded.strip(), "%m/%d/%Y").strftime("%m/%d/%Y")
+            except Exception:
+                filed = recorded[:10] if recorded else ""
+
+            # Extract address from legal description
+            address = ""
+            m = re.search(r"(\d+\s+\S+(?:\s+\S+){1,5}(?:ST|AVE|BLVD|DR|RD|LN|CT|WAY|PL|TRL|PKWY))",
+                          legal, re.I)
+            if m:
+                address = m.group(1).strip().title()
+
+            clerk_url = f"https://dallas.tx.publicsearch.us/doc/{internal_id}"
+
+            return {
+                "doc_num":       doc_num or internal_id,
+                "doc_type":      doc_type,
+                "cat":           cat,
+                "cat_label":     cat_label,
+                "filed":         filed,
+                "owner":         grantor.strip().title(),
+                "grantee":       grantee.strip().title(),
+                "amount":        None,
+                "legal":         legal[:200],
+                "clerk_url":     clerk_url,
+                "prop_address":  address,
+                "prop_city":     town.strip().title() or "Dallas",
+                "prop_state":    "TX",
+                "prop_zip":      "",
+                "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
+                "source":        "Dallas County Clerk",
+                "neighborhood":  "", "viol_status": "", "viol_desc": "",
+                "viol_severity": "",
+                "delinquent":    False, "delinq_amt": "",
+                "homestead":     None, "appraised":  "",
+                "out_of_state":  False,
+                "luc":           "", "luc_desc": "",
+                "score":         0,  "flags":    [],
+            }
+        except Exception as e:
+            log.debug("PublicSearch row parse error: %s", e)
+            return None
+
+    def _fetch_doc(self, session, doc_id: str, cat: str, cat_label: str) -> Optional[dict]:
+        try:
+            url = self.DOC_URL.format(doc_id)
+            r   = session.get(url, timeout=20)
+            if r.status_code != 200:
+                return None
+            soup = BeautifulSoup(r.text, "lxml")
+
+            def get_field(label):
+                for el in soup.find_all(string=re.compile(label, re.I)):
+                    parent = el.find_parent()
+                    if parent:
+                        nxt = parent.find_next_sibling()
+                        if nxt:
+                            return nxt.get_text(strip=True)
+                return ""
+
+            doc_num  = get_field("Document Number") or doc_id
+            doc_type = get_field("Document Type") or cat
+            recorded = get_field("Recorded Date") or ""
+            grantor  = get_field("GRANTOR") or get_field("Grantor") or ""
+            grantee  = get_field("GRANTEE") or get_field("Grantee") or ""
+            legal    = get_field("Legal Description") or ""
+            consider = get_field("Consideration") or ""
+
+            filed = ""
+            try:
+                filed = datetime.strptime(recorded.strip()[:10], "%m/%d/%Y").strftime("%m/%d/%Y")
+            except Exception:
+                filed = recorded[:10] if recorded else ""
+
+            address = ""
+            m = re.search(r"(\d+\s+\S+(?:\s+\S+){1,5}(?:ST|AVE|BLVD|DR|RD|LN|CT|WAY|PL|TRL|PKWY))\b",
+                          legal, re.I)
+            if m:
+                address = m.group(1).strip().title()
+
+            amount = None
+            if consider:
+                m2 = re.search(r"[\d,]+", consider.replace("$", ""))
+                if m2:
+                    try:
+                        amount = float(m2.group().replace(",", ""))
+                    except Exception:
+                        pass
+
+            if not grantor and not doc_num:
+                return None
+
+            return {
+                "doc_num":       doc_num,
+                "doc_type":      doc_type,
+                "cat":           cat,
+                "cat_label":     cat_label,
+                "filed":         filed,
+                "owner":         grantor.strip().title(),
+                "grantee":       grantee.strip().title(),
+                "amount":        amount,
+                "legal":         legal[:200],
+                "clerk_url":     url,
+                "prop_address":  address,
+                "prop_city":     "Dallas",
+                "prop_state":    "TX",
+                "prop_zip":      "",
+                "mail_address":  "", "mail_city": "", "mail_state": "TX", "mail_zip": "",
+                "source":        "Dallas County Clerk",
+                "neighborhood":  "", "viol_status": "", "viol_desc": "",
+                "viol_severity": "",
+                "delinquent":    False, "delinq_amt": "",
+                "homestead":     None, "appraised":  "",
+                "out_of_state":  False,
+                "luc":           "", "luc_desc": "",
+                "score":         0,  "flags":    [],
+            }
+        except Exception as e:
+            log.debug("PublicSearch doc %s error: %s", doc_id, e)
+            return None
+
 class DallasTaxSaleScraper:
     """
     Pulls Dallas-area tax sale properties from the LGBS map API.
