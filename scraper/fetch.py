@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Dallas Intel â€” Motivated Seller Lead Scraper
 =============================================
