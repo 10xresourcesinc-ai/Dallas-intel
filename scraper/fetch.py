@@ -309,6 +309,23 @@ class DallasCodeScraper:
             "score":         0,
             "flags":         flags,
         }
+
+
+# ===========================================================================
+# Source: NOFC + LP -- Dallas County Clerk PublicSearch
+# ===========================================================================
+
+class DallasPublicSearchScraper:
+    BASE       = "https://dallas.tx.publicsearch.us"
+    SEARCH_URL = "https://dallas.tx.publicsearch.us/results"
+    DOC_URL    = "https://dallas.tx.publicsearch.us/doc/{}"
+
+    SEARCHES = [
+        ("trustee sale", "NOFC", "Notice of Foreclosure"),
+        ("foreclosure",  "NOFC", "Notice of Foreclosure"),
+        ("lis pendens",  "LP",   "Lis Pendens"),
+    ]
+
     def _make_session(self):
         s = make_session()
         s.headers.update({
