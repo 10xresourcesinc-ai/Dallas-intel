@@ -1800,7 +1800,7 @@ class LeadScorer:
         FIX 6 â€” cross-signal stacking uses the pre-built index instead of
                  scanning all_recs on every call.
         """
-        week_ago = datetime.now() - timedelta(days=7)  # FIX 5
+        week_ago = (datetime.now() - timedelta(days=7)).date()  # FIX 5
 
         flags, points = [], 15
         cat   = rec.get("cat", "")
@@ -1841,14 +1841,21 @@ class LeadScorer:
             if len(owner_cats) >= 3:
                 flags.append("Multi-hit owner"); points += 15
 
-        # Debt size
-        if amt:
-            if   amt > 100_000: flags.append("High debt (>$100k)"); points += 15
-            elif amt >  50_000: points += 8
+        # Debt & equity — reward low debt and high equity (investor criteria)
+        appr_val = None
+        try:
+            appr_val = float(str(rec.get("appraised") or "").replace("$", "").replace(",", ""))
+        except Exception:
+            appr_val = None
+        if amt and appr_val:
+            if amt < 50_000:
+                flags.append("Low debt (<$50k)"); points += 15
+            if appr_val - amt >= 100_000:
+                flags.append("High equity (>$100k)"); points += 15
 
         # Recency â€” FIX 5: uses local week_ago computed above
         try:
-            dt = datetime.strptime(rec.get("filed", "").strip(), "%m/%d/%Y")
+            dt = datetime.strptime(rec.get("filed", "").strip(), "%m/%d/%Y").date()
             if dt >= week_ago:
                 flags.append("New this week"); points += 5
         except Exception:
